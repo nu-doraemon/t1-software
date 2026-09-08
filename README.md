@@ -17,8 +17,8 @@ t1-software/
 |       +-- tests/
 |           +-- test_integration.py   # JAXTPC -> pimm-data HDF5 seam smoke test
 +-- scripts/
-|   +-- nightly-build.sh   # builds both images to $LSCRATCH, runs %test + integration test
-+-- images/                 # gitignored symlink -> $LSCRATCH/t1-software-images
+|   +-- nightly-build.sh   # builds both images, runs %test + integration test
++-- images/                 # gitignored default output dir (override via $T1_SOFTWARE_IMAGES_DIR)
 ```
 
 ## Building locally
@@ -30,11 +30,16 @@ scripts/nightly-build.sh          # cuda12, the only variant built today
 Requires `apptainer` with unprivileged `--fakeroot` builds (confirmed
 working without a `/etc/subuid`/`/etc/subgid` entry on the nodes this has
 been built on so far). No `docker`/`podman` daemon needed or used.
+Apptainer's build scratch/cache is redirected to `$LSCRATCH` (required);
+building a multi-GB image under a small default `/tmp` fails or thrashes.
 
-Builds land in `images/` (a symlink into `$LSCRATCH`, never git-tracked --
-see `.gitignore`). Re-running is idempotent per tag (see below): the same
-commit on the same day overwrites its own dated file, and always
-re-points the `-latest.sif` symlinks.
+Final images land in `images/` next to this repo by default (gitignored
+-- see `.gitignore`). Set `$T1_SOFTWARE_IMAGES_DIR` before invoking the
+script to redirect them elsewhere -- e.g. a workspace embedding this repo
+under its own `src/` typically points it at that workspace's own image
+store rather than accepting the default. Re-running is idempotent per tag
+(see below): the same commit on the same day overwrites its own dated
+file, and always re-points the `-latest.sif` symlinks.
 
 ## Image versioning
 
@@ -55,7 +60,7 @@ Every image `nightly-build.sh` produces is named:
   independent of the upstream pins (JAXTPC/pimm-data commits), which are
   recorded separately.
 
-Two more files land next to each dated image in `images/`:
+Two more files land next to each dated image in the output directory:
 
 - `<name>.manifest.json` -- build timestamp, cuda variant, this repo's git
   commit, and the layer's upstream pins (from its `versions.env`).
