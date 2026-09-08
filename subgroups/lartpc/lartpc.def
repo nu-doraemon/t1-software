@@ -1,0 +1,52 @@
+Bootstrap: localimage
+From: {{ BASE_SIF }}
+
+# t1-lartpc -- LArTPC subgroup overlay on top of t1-base. Adds JAXTPC
+# (detector simulation) and pimm-data (HDF5 dataset loader), pinned
+# independently of each other and of the shared Torch/JAX base.
+#
+# Templated with:
+#   apptainer build --build-arg-file subgroups/lartpc/versions.env \
+#     --build-arg BASE_SIF=images/t1-base-cuda12.sif \
+#     images/t1-lartpc-cuda12.sif subgroups/lartpc/lartpc.def
+
+%post
+    set -eu
+    apt-get update
+    apt-get install -y --no-install-recommends git
+    rm -rf /var/lib/apt/lists/*
+
+    mkdir -p /opt
+    cd /opt
+    git clone --quiet https://github.com/DeepLearnPhysics/JAXTPC.git
+    cd JAXTPC
+    git checkout --quiet {{ JAXTPC_COMMIT }}
+    # JAXTPC's own requirements.txt is bounded (jax>=0.4,<0.7) so it never
+    # clobbers the base image's JAX pin; Torch is not in this file at all
+    # (base already installed it, and must stay untouched by this step).
+    python3.11 -m pip install --no-cache-dir -r requirements.txt
+
+    cd /opt
+    git clone --quiet https://github.com/omaralterkait/pimm-data.git
+    cd pimm-data
+    git checkout --quiet {{ PIMM_DATA_COMMIT }}
+    # pimm-data is not LArTPC-specific and installs on top of the shared
+    # base without pulling its own Torch (its pyproject deliberately
+    # excludes torch from its dependency list, so this install can never
+    # silently reinstall a different Torch build).
+    python3.11 -m pip install --no-cache-dir .
+
+%environment
+    export PYTHONPATH=/opt/JAXTPC:$PYTHONPATH
+
+%files
+    subgroups/lartpc/tests/ /opt/t1-lartpc-tests
+
+%test
+    python3.11 -c "\
+import sys; sys.path.insert(0, '/opt/JAXTPC'); \
+from tools.geometry import generate_detector; \
+from tools.simulation import DetectorSimulator; \
+import pimm_data; \
+print('JAXTPC + pimm-data import OK')"
+    python3.11 /opt/t1-lartpc-tests/test_integration.py

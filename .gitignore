@@ -1,0 +1,9 @@
+# Built container images are large, ephemeral, rebuildable-from-recipe
+# binaries -- never git-tracked. `images/` is a symlink into $LSCRATCH;
+# ignore both the link and any stray .sif that ends up alongside it.
+images
+*.sif
+*.sandbox/
+
+# Local build scratch (nightly-build.sh working files).
+.build-tmp/

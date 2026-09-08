@@ -1,0 +1,41 @@
+Bootstrap: docker
+From: nvidia/cuda:12.9.1-cudnn-devel-ubuntu22.04
+
+# t1-base -- shared Torch x JAX layer for all T1-LArTPC subgroups. No
+# subgroup-specific package (JAXTPC, pimm-data, LUCiD, ...) belongs in
+# this image -- add those in subgroups/<name>/*.def instead, layered on
+# top via `Bootstrap: localimage`.
+#
+# Templated with: apptainer build --build-arg-file base/versions.env \
+#   images/t1-base-{{ CUDA_VARIANT }}.sif base/base.def
+
+%post
+    set -eu
+    apt-get update
+    apt-get install -y --no-install-recommends python3.11 python3.11-venv python3-pip
+    rm -rf /var/lib/apt/lists/*
+    python3.11 -m pip install --no-cache-dir --upgrade pip
+
+    # Torch pinned FIRST via its own CUDA-tagged index -- installing JAX
+    # (or anything else) before this must never be allowed to pull a
+    # different Torch build. pip resolves against whatever is already
+    # installed, so later installs (JAX here, or a subgroup's own
+    # dependencies) must never be allowed to reinstall/upgrade torch to a
+    # non-CUDA-tagged wheel.
+    python3.11 -m pip install --no-cache-dir \
+        "torch=={{ TORCH_VERSION }}" --index-url {{ TORCH_INDEX_URL }}
+
+    # JAX CPU/GPU wheel bundle (installs nvidia-cuda-runtime, nvidia-cudnn-cu12,
+    # nvidia-cusolver-cu12, etc. from PyPI -- CUDA 12 only; do not pass the
+    # cuda13 extra here since this def only ever produces the cuda12 variant
+    # until a cuda13-capable driver host exists to build and verify it).
+    python3.11 -m pip install --no-cache-dir "jax[cuda12]=={{ JAX_VERSION }}"
+
+%environment
+    export PYTHONPATH=/opt
+    export PYTHONDONTWRITEBYTECODE=1
+
+%test
+    python3.11 -c "import torch, jax; \
+print('torch', torch.__version__, 'cuda', torch.version.cuda); \
+print('jax', jax.__version__, 'devices', jax.devices())"
