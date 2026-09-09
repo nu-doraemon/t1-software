@@ -12,8 +12,8 @@ t1-software/
 |   +-- versions.env       # CUDA_VARIANT, TORCH_VERSION, TORCH_INDEX_URL, JAX_VERSION
 +-- subgroups/
 |   +-- lartpc/
-|       +-- lartpc.def      # Bootstrap: localimage (t1-base) -> clones + pins JAXTPC, pimm-data
-|       +-- versions.env    # JAXTPC_COMMIT, PIMM_DATA_COMMIT
+|       +-- lartpc.def      # Bootstrap: localimage (t1-base) -> clones + pins JAXTPC, pimm-data, goop
+|       +-- versions.env    # JAXTPC_COMMIT, PIMM_DATA_COMMIT, GOOP_COMMIT
 |       +-- tests/
 |           +-- test_integration.py   # JAXTPC -> pimm-data HDF5 seam smoke test
 +-- scripts/
@@ -30,8 +30,13 @@ scripts/nightly-build.sh          # cuda12, the only variant built today
 Requires `apptainer` with unprivileged `--fakeroot` builds (confirmed
 working without a `/etc/subuid`/`/etc/subgid` entry on the nodes this has
 been built on so far). No `docker`/`podman` daemon needed or used.
-Apptainer's build scratch/cache is redirected to `$LSCRATCH` (required);
-building a multi-GB image under a small default `/tmp` fails or thrashes.
+Apptainer's build scratch/cache, and the finished `.sif` images
+themselves, are staged under `$LSCRATCH` (required) and only moved into
+the images dir below once both builds and the `%test` step succeed --
+building a multi-GB image under a small default `/tmp` fails or
+thrashes, and writing the finished multi-GB `.sif` directly to a
+shared/NFS images dir mid-build is much slower than one local build plus
+one final move.
 
 Final images land in `images/` next to this repo by default (gitignored
 -- see `.gitignore`). Set `$T1_SOFTWARE_IMAGES_DIR` before invoking the
@@ -57,7 +62,7 @@ Every image `nightly-build.sh` produces is named:
 - `git-sha`: this repo's short (8-char) commit at build time, suffixed
   `-dirty` if the working tree had uncommitted changes. This ties an
   image back to the exact `.def`/`versions.env` recipe that produced it,
-  independent of the upstream pins (JAXTPC/pimm-data commits), which are
+  independent of the upstream pins (JAXTPC/pimm-data/goop commits), which are
   recorded separately.
 
 Two more files land next to each dated image in the output directory:

@@ -5,9 +5,13 @@
 #
 # Apptainer's build scratch/cache is redirected to $LSCRATCH (large local
 # disk -- building a multi-GB image under a small /tmp fails or thrashes).
-# Final .sif images and their manifests land in $T1_SOFTWARE_IMAGES_DIR,
-# default ./images next to this repo; set the env var to redirect them to
-# a shared/persistent location instead (this repo never assumes one). No
+# Final .sif images are also *built* under $LSCRATCH first and only moved
+# (one big sequential transfer per file) to $T1_SOFTWARE_IMAGES_DIR once
+# both builds and the %test below succeed -- writing the multi-GB .sif
+# directly to a shared/NFS images dir mid-build is much slower than one
+# local build + one move. Default $T1_SOFTWARE_IMAGES_DIR is ./images next
+# to this repo; set the env var to redirect the final images to a
+# shared/persistent location instead (this repo never assumes one). No
 # docker/podman daemon; unprivileged apptainer --fakeroot only (confirmed
 # working without a /etc/subuid or /etc/subgid entry on the nodes this
 # has been built on so far).
@@ -32,6 +36,11 @@ esac
 export APPTAINER_TMPDIR="$LSCRATCH/t1-software-build/tmp"
 export APPTAINER_CACHEDIR="$LSCRATCH/t1-software-build/cache"
 mkdir -p "$APPTAINER_TMPDIR" "$APPTAINER_CACHEDIR"
+
+# Finished .sif images are assembled here first (see header comment) and
+# only moved into $IMAGES_DIR after a successful build + %test.
+SCRATCH_IMAGES_DIR="$LSCRATCH/t1-software-build/images"
+mkdir -p "$SCRATCH_IMAGES_DIR"
 
 IMAGES_DIR="${T1_SOFTWARE_IMAGES_DIR:-$REPO_ROOT/images}"
 mkdir -p "$IMAGES_DIR"
@@ -95,32 +104,49 @@ BASE_ARGFILE="$(mktemp)"
 LARTPC_ARGFILE="$(mktemp)"
 trap 'rm -f "$BASE_ARGFILE" "$LARTPC_ARGFILE"' EXIT
 argfile base/versions.env > "$BASE_ARGFILE"
-BASE_IMAGE="$IMAGES_DIR/t1-base-${VARIANT}-${TAG}.sif"
+BASE_SIF_SCRATCH="$SCRATCH_IMAGES_DIR/t1-base-${VARIANT}-${TAG}.sif"
 # CUDA_VARIANT is documentation-only in base.def (the docker From: tag is
 # fixed, not templated) -- downgrade apptainer's unused-build-arg check to
 # a warning instead of failing the build on it.
 apptainer build --fakeroot --force --warn-unused-build-args \
     --build-arg-file "$BASE_ARGFILE" \
-    "$BASE_IMAGE" base/base.def
+    "$BASE_SIF_SCRATCH" base/base.def
+
+echo "== building t1-lartpc-${VARIANT} (${TAG}) =="
+argfile subgroups/lartpc/versions.env > "$LARTPC_ARGFILE"
+LARTPC_SIF_SCRATCH="$SCRATCH_IMAGES_DIR/t1-lartpc-${VARIANT}-${TAG}.sif"
+# --notest: apptainer build otherwise auto-runs %test right after %post
+# (only --notest/-T disables that); lartpc's %test now also re-runs
+# JAXTPC's, pimm-data's, and goop's full vendored suites (ROADMAP.md
+# "Tests" item), so running it twice -- once implicitly here, once via
+# the explicit `apptainer test` below -- would double that real cost.
+apptainer build --fakeroot --force --notest \
+    --build-arg-file "$LARTPC_ARGFILE" \
+    --build-arg "BASE_SIF=${BASE_SIF_SCRATCH}" \
+    "$LARTPC_SIF_SCRATCH" subgroups/lartpc/lartpc.def
+
+echo "== running lartpc %test (vendored JAXTPC/pimm-data/goop suites + integration test) =="
+apptainer test "$LARTPC_SIF_SCRATCH"
+
+# Both builds and the test above passed -- only now move the finished
+# .sif files off local scratch into the (typically NFS) images dir, one
+# big sequential transfer per file. set -e means a failed build or test
+# never reaches here, so a broken image never lands in $IMAGES_DIR.
+BASE_IMAGE="$IMAGES_DIR/$(basename "$BASE_SIF_SCRATCH")"
+LARTPC_IMAGE="$IMAGES_DIR/$(basename "$LARTPC_SIF_SCRATCH")"
+mv "$BASE_SIF_SCRATCH" "$BASE_IMAGE"
+mv "$LARTPC_SIF_SCRATCH" "$LARTPC_IMAGE"
+
 update_latest "$(basename "$BASE_IMAGE")" "$IMAGES_DIR/t1-base-${VARIANT}-latest.sif"
 write_manifest "$IMAGES_DIR/t1-base-${VARIANT}-${TAG}.manifest.json" \
     "torch_version=$(pin base/versions.env TORCH_VERSION)" \
     "jax_version=$(pin base/versions.env JAX_VERSION)"
 
-echo "== building t1-lartpc-${VARIANT} (${TAG}) =="
-argfile subgroups/lartpc/versions.env > "$LARTPC_ARGFILE"
-LARTPC_IMAGE="$IMAGES_DIR/t1-lartpc-${VARIANT}-${TAG}.sif"
-apptainer build --fakeroot --force \
-    --build-arg-file "$LARTPC_ARGFILE" \
-    --build-arg "BASE_SIF=${BASE_IMAGE}" \
-    "$LARTPC_IMAGE" subgroups/lartpc/lartpc.def
 update_latest "$(basename "$LARTPC_IMAGE")" "$IMAGES_DIR/t1-lartpc-${VARIANT}-latest.sif"
 write_manifest "$IMAGES_DIR/t1-lartpc-${VARIANT}-${TAG}.manifest.json" \
     "jaxtpc_commit=$(pin subgroups/lartpc/versions.env JAXTPC_COMMIT)" \
-    "pimm_data_commit=$(pin subgroups/lartpc/versions.env PIMM_DATA_COMMIT)"
-
-echo "== running lartpc %test (includes JAXTPC -> pimm-data integration test) =="
-apptainer test "$LARTPC_IMAGE"
+    "pimm_data_commit=$(pin subgroups/lartpc/versions.env PIMM_DATA_COMMIT)" \
+    "goop_commit=$(pin subgroups/lartpc/versions.env GOOP_COMMIT)"
 
 echo "== done: ${BASE_IMAGE} ${LARTPC_IMAGE} =="
 echo "== latest: $IMAGES_DIR/t1-base-${VARIANT}-latest.sif $IMAGES_DIR/t1-lartpc-${VARIANT}-latest.sif =="

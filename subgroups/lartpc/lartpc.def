@@ -2,8 +2,20 @@ Bootstrap: localimage
 From: {{ BASE_SIF }}
 
 # t1-lartpc -- LArTPC subgroup overlay on top of t1-base. Adds JAXTPC
-# (detector simulation) and pimm-data (HDF5 dataset loader), pinned
+# (detector simulation), pimm-data (HDF5 dataset loader), and goop
+# (differentiable PMT/light-readout simulation), each pinned
 # independently of each other and of the shared Torch/JAX base.
+#
+# goop has no setup.py/pyproject -- upstream runs it from source via
+# PYTHONPATH, not `pip install`, so only its runtime deps are installed
+# below and the checkout itself is left on disk. goop vendors its own
+# JAXTPC copy as a git submodule (goop/jaxtpc); that submodule is
+# deliberately left uninitialized here (plain `git clone`, no
+# --recursive) so goop's `tools.*` imports resolve against this image's
+# single pinned /opt/JAXTPC checkout instead of a second, potentially
+# skewed JAXTPC commit. goop's own multi-GB photon-library asset
+# (default /sdf/data/neutrino/youngsam/compressed_plib_b04_quantile_log_n50.h5)
+# is a host-side file read at runtime, never baked into the image.
 #
 # Templated with:
 #   apptainer build --build-arg-file subgroups/lartpc/versions.env \
@@ -15,6 +27,21 @@ From: {{ BASE_SIF }}
     apt-get update
     apt-get install -y --no-install-recommends git
     rm -rf /var/lib/apt/lists/*
+
+    # goop's own runtime pins (its environment.yml), installed before
+    # JAXTPC/pimm-data below so their unbounded `numpy` requirement is
+    # satisfied by this pin instead of the other way around -- pip never
+    # upgrades an already-satisfied unbounded dependency, so pinning
+    # numpy<2 first keeps it <2 for the rest of this image's installs.
+    # jax 0.6.2 (base layer) only requires numpy>=1.26, so this stays
+    # compatible with the shared base. pytest-benchmark is not in
+    # environment.yml but IS required just to parse goop's own
+    # pytest.ini (`addopts = --benchmark-skip` fails at argument-parsing
+    # time, before any test runs, if the plugin providing that flag is
+    # absent) -- installed here too so `pytest /opt/goop/tests` below
+    # works at all.
+    python3.11 -m pip install --no-cache-dir \
+        "numpy<2" scipy h5py pyyaml matplotlib tqdm pytest pytest-benchmark
 
     mkdir -p /opt
     cd /opt
@@ -33,11 +60,30 @@ From: {{ BASE_SIF }}
     # pimm-data is not LArTPC-specific and installs on top of the shared
     # base without pulling its own Torch (its pyproject deliberately
     # excludes torch from its dependency list, so this install can never
-    # silently reinstall a different Torch build).
-    python3.11 -m pip install --no-cache-dir .
+    # silently reinstall a different Torch build). Editable (`-e`), per
+    # pyproject.toml's own "editable install must not pull a different
+    # CUDA build" comment -- a regular `pip install .` build excludes
+    # src/pimm_data/data/*.json (no package-data/MANIFEST.in declared
+    # upstream), which breaks its own plane-geometry lookups; editable
+    # keeps the package pointed at this checkout's data/ dir instead.
+    # `.[test]` pulls its own pytest extra so its suite is runnable
+    # in-image below. pywavelets is a real runtime dependency of its
+    # readers/coeff_tpc.py wavelet-coefficient reader, exercised by its
+    # own test_coeff_dataset.py, but missing from pyproject.toml's
+    # dependency list -- installed explicitly to cover that gap.
+    python3.11 -m pip install --no-cache-dir -e .[test] pywavelets
+
+    cd /opt
+    # Non-recursive clone -- see header comment: goop/jaxtpc stays an
+    # empty, uninitialized submodule directory on purpose. goop itself is
+    # not pip-installed (no setup.py/pyproject); it stays plain source on
+    # disk and is added to PYTHONPATH below.
+    git clone --quiet https://github.com/CIDeR-ML/goop.git
+    cd goop
+    git checkout --quiet {{ GOOP_COMMIT }}
 
 %environment
-    export PYTHONPATH=/opt/JAXTPC:$PYTHONPATH
+    export PYTHONPATH=/opt/JAXTPC:/opt/goop:$PYTHONPATH
 
 %files
     subgroups/lartpc/tests/ /opt/t1-lartpc-tests
@@ -48,5 +94,19 @@ import sys; sys.path.insert(0, '/opt/JAXTPC'); \
 from tools.geometry import generate_detector; \
 from tools.simulation import DetectorSimulator; \
 import pimm_data; \
-print('JAXTPC + pimm-data import OK')"
+sys.path.insert(0, '/opt/goop'); \
+import goop; \
+print('JAXTPC + pimm-data + goop import OK')"
     python3.11 /opt/t1-lartpc-tests/test_integration.py
+
+    # Re-run each vendored package's own unit-test suite in-image
+    # (ROADMAP.md "Tests" item) rather than trusting the import check
+    # alone. All three suites self-skip GPU/asset-dependent cases (real
+    # photon-library lookups, SIREN checkpoints, --nv-only paths), so
+    # they stay green on the CPU-only, no-GPU host this script builds on.
+    echo "== JAXTPC unit suite =="
+    JAX_PLATFORM_NAME=cpu python3.11 -m pytest -q /opt/JAXTPC/tests
+    echo "== pimm-data unit suite =="
+    python3.11 -m pytest -q /opt/pimm-data/tests
+    echo "== goop unit suite =="
+    python3.11 -m pytest -q /opt/goop/tests

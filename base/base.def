@@ -31,6 +31,42 @@ From: nvidia/cuda:12.9.1-cudnn-devel-ubuntu22.04
     # until a cuda13-capable driver host exists to build and verify it).
     python3.11 -m pip install --no-cache-dir "jax[cuda12]=={{ JAX_VERSION }}"
 
+    # Ubuntu 22.04's apt python3.11 package is frozen at 3.11.0rc1 (see
+    # `python3.11 --version`), which predates CPython's late-added
+    # int<->str conversion digit-limit guard (gh-95778,
+    # sys.get_int_max_str_digits/set_int_max_str_digits). torch._dynamo's
+    # own sys polyfill (torch/_dynamo/polyfills/sys.py) references both
+    # unconditionally whenever sys.version_info >= (3, 11) -- true even
+    # for this rc build -- so ANY code path that imports torch._dynamo
+    # (e.g. torch.utils.checkpoint's default non-reentrant mode, used by
+    # goop's differentiable TOF sampler) crashes with AttributeError.
+    # /usr/lib/python3.11 precedes site-packages on sys.path, so Ubuntu's
+    # own sitecustomize.py there (apport exception-hook install) is the
+    # one `site` actually imports at startup -- append to it (not a
+    # sitecustomize.py of our own under dist-packages, which would be
+    # shadowed and silently never run) so the polyfill takes effect for
+    # every python3.11 invocation in this image; polyfill with the real
+    # feature's documented default (4300) and no actual enforcement,
+    # matching this rc build's pre-feature behavior -- a pure addition,
+    # never touched if a future base image ships a python3.11 final
+    # release that already has it.
+    cat >> /usr/lib/python3.11/sitecustomize.py <<'EOF'
+import sys
+if not hasattr(sys, "get_int_max_str_digits"):
+    sys._int_max_str_digits = 4300
+
+    def get_int_max_str_digits():
+        return sys._int_max_str_digits
+
+    def set_int_max_str_digits(maxdigits):
+        if not isinstance(maxdigits, int):
+            raise TypeError("maxdigits must be an int")
+        sys._int_max_str_digits = maxdigits
+
+    sys.get_int_max_str_digits = get_int_max_str_digits
+    sys.set_int_max_str_digits = set_int_max_str_digits
+EOF
+
 %environment
     export PYTHONPATH=/opt
     export PYTHONDONTWRITEBYTECODE=1
