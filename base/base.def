@@ -12,7 +12,8 @@ From: nvidia/cuda:12.9.1-cudnn-devel-ubuntu22.04
 %post
     set -eu
     apt-get update
-    apt-get install -y --no-install-recommends python3.11 python3.11-venv python3-pip
+    apt-get install -y --no-install-recommends \
+        python3.11 python3.11-venv python3-pip curl ca-certificates
     rm -rf /var/lib/apt/lists/*
     python3.11 -m pip install --no-cache-dir --upgrade pip
 
@@ -67,6 +68,81 @@ if not hasattr(sys, "get_int_max_str_digits"):
     sys.set_int_max_str_digits = set_int_max_str_digits
 EOF
 
+    # Shared ROOT x GEANT4 layer (base/versions.env "Shared ROOT x GEANT4
+    # layer" comment) -- conda-forge prebuilt binaries via micromamba
+    # into an isolated prefix; building either from source in a fakeroot
+    # apptainer %post would take hours. Deliberately NOT added to this
+    # %environment's PATH/LD_LIBRARY_PATH below: root_base's own PyROOT
+    # build carries its own CPython 3.11, and prepending or appending its
+    # lib dir globally would risk exactly the "two native stacks fighting
+    # over the dynamic linker" problem already solved for Torch x JAX
+    # above -- ROOT/GEANT4's own OpenSSL/zlib/libstdc++ must never shadow
+    # what python3.11's CUDA wheels expect. A subgroup that needs to
+    # build or run ROOT/GEANT4-based tools sources
+    # /opt/setup-g4root.sh in its own scoped shell first, the same way
+    # edep-sim's and DLPGenerator's own upstream docs already expect
+    # `source thisroot.sh` / `source geant4.sh` before use.
+    curl -fsSL -o /usr/local/bin/micromamba \
+        "https://github.com/mamba-org/micromamba-releases/releases/download/{{ MICROMAMBA_VERSION }}/micromamba-linux-64"
+    echo "{{ MICROMAMBA_SHA256 }}  /usr/local/bin/micromamba" | sha256sum -c -
+    chmod +x /usr/local/bin/micromamba
+
+    # `expat` pinned explicitly, not left to solve in transitively: geant4's
+    # own conda-forge runtime dependency only pulls in `libexpat` (the
+    # shared library), never the `expat` dev subpackage (headers,
+    # unversioned .so, CMake config) a downstream consumer building
+    # against GEANT4 -- edep-sim, subgroups/lartpc/lartpc.def -- needs for
+    # its own `find_package(EXPAT)` to succeed. `hdf5` added for the same
+    # reason: neither root_base nor geant4 pulls it in on their own, but
+    # edep-sim's C++ H5DLP persistence layer (its own `find_package(HDF5)`,
+    # the seam DLPGenerator's bomb-macro -> H5 output round-trips through
+    # with pimm-data) needs the real library + headers built against this
+    # same conda-g4 toolchain -- pimm-data's own h5py (python3.11
+    # dist-packages) is a separate stack that never satisfies a C++ link.
+    micromamba create -y -p /opt/conda-g4 -c conda-forge --override-channels \
+        "root_base={{ ROOT_VERSION }}" \
+        "geant4={{ GEANT4_VERSION }}={{ GEANT4_BUILD_VARIANT }}" \
+        expat hdf5 numpy pyyaml
+    micromamba clean -y -a
+    rm -f /usr/local/bin/micromamba
+
+    cat > /opt/setup-g4root.sh <<'SETUP_EOF'
+#!/usr/bin/env bash
+# Activates the shared ROOT + GEANT4 conda-forge environment
+# (base/versions.env ROOT_VERSION / GEANT4_VERSION) for building or
+# running the Geant4-based tools layered on top of it (currently
+# DLPGenerator + edep-sim, subgroups/lartpc/lartpc.def). NOT sourced by
+# %environment or any %post step outside this scoped use -- see the
+# comment beside where this file is written in base/base.def.
+#
+#   source /opt/setup-g4root.sh
+#
+export G4ROOT_CONDA_PREFIX="${G4ROOT_CONDA_PREFIX:-/opt/conda-g4}"
+
+# geant4-data-* conda packages (G4NDL, G4EMLOW, ...) set their own
+# G4*DATA env vars via conda activate.d hooks; run those directly instead
+# of pulling in micromamba's full shell-hook machinery for a prefix this
+# image never swaps out. These third-party scripts assume the real
+# `conda activate` has already exported CONDA_PREFIX, and are not
+# written to be `set -u` (nounset) safe (e.g. the gcc_linux-64 compiler
+# activation script root_base pulls in) -- export CONDA_PREFIX
+# ourselves and relax nounset only for this loop, restoring it
+# afterward so a caller's own `set -eu` is unaffected past this point.
+export CONDA_PREFIX="$G4ROOT_CONDA_PREFIX"
+case "$-" in *u*) _g4root_had_nounset=1 ;; *) _g4root_had_nounset=0 ;; esac
+set +u
+for f in "$G4ROOT_CONDA_PREFIX"/etc/conda/activate.d/*.sh; do
+    [ -e "$f" ] && . "$f"
+done
+[ "$_g4root_had_nounset" = 1 ] && set -u
+unset _g4root_had_nounset
+
+export PATH="$G4ROOT_CONDA_PREFIX/bin:$PATH"
+export LD_LIBRARY_PATH="$G4ROOT_CONDA_PREFIX/lib:${LD_LIBRARY_PATH:-}"
+export CMAKE_PREFIX_PATH="$G4ROOT_CONDA_PREFIX:${CMAKE_PREFIX_PATH:-}"
+SETUP_EOF
+    chmod +x /opt/setup-g4root.sh
+
 %environment
     export PYTHONPATH=/opt
     export PYTHONDONTWRITEBYTECODE=1
@@ -75,3 +151,16 @@ EOF
     python3.11 -c "import torch, jax; \
 print('torch', torch.__version__, 'cuda', torch.version.cuda); \
 print('jax', jax.__version__, 'devices', jax.devices())"
+
+    # Shared ROOT x GEANT4 layer: scoped activation (never the ambient
+    # PATH above, see %post), proving the conda-forge install itself is
+    # sound independent of anything a subgroup later builds against it.
+    # apptainer runs %test under /bin/sh (dash) -- `source` is a bash
+    # builtin, so this needs a real bash, not `.` swapped in for dash.
+    bash <<'G4ROOT_TEST_EOF'
+set -eu
+source /opt/setup-g4root.sh
+root-config --version
+geant4-config --version
+python3 -c "import ROOT; print('PyROOT', ROOT.gROOT.GetVersion())"
+G4ROOT_TEST_EOF

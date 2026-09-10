@@ -2,20 +2,22 @@
 
 T1-LArTPC public data-challenge container (T1-FM foundation-models thrust).
 
-One shared base image (Torch x JAX only) plus one overlay per detector
-technology subgroup. Only the LArTPC subgroup exists so far.
+One shared base image (Torch x JAX, plus a ROOT x GEANT4 conda-forge
+layer used by event-generation subgroup overlays) plus one overlay per
+detector technology subgroup. Only the LArTPC subgroup exists so far.
 
 ```
 t1-software/
 +-- base/
-|   +-- base.def          # Bootstrap: docker (nvidia/cuda) -> installs Torch + JAX
-|   +-- versions.env       # CUDA_VARIANT, TORCH_VERSION, TORCH_INDEX_URL, JAX_VERSION
+|   +-- base.def          # Bootstrap: docker (nvidia/cuda) -> installs Torch + JAX + ROOT/GEANT4 (conda-forge)
+|   +-- versions.env       # CUDA_VARIANT, TORCH_VERSION, TORCH_INDEX_URL, JAX_VERSION, ROOT_VERSION, GEANT4_VERSION, ...
 +-- subgroups/
 |   +-- lartpc/
-|       +-- lartpc.def      # Bootstrap: localimage (t1-base) -> clones + pins JAXTPC, pimm-data, goop
-|       +-- versions.env    # JAXTPC_COMMIT, PIMM_DATA_COMMIT, GOOP_COMMIT
+|       +-- lartpc.def      # Bootstrap: localimage (t1-base) -> clones + pins JAXTPC, pimm-data, goop, DLPGenerator, edep-sim
+|       +-- versions.env    # JAXTPC_COMMIT, PIMM_DATA_COMMIT, GOOP_COMMIT, DLPGENERATOR_COMMIT, EDEPSIM_COMMIT
 |       +-- tests/
-|           +-- test_integration.py   # JAXTPC -> pimm-data HDF5 seam smoke test
+|           +-- test_integration.py         # JAXTPC -> pimm-data HDF5 seam smoke test
+|           +-- test_generator_edepsim.sh   # DLPGenerator -> edep-sim seam smoke test (bomb-macro -> H5DLP)
 +-- scripts/
 |   +-- nightly-build.sh   # builds both images, runs %test + integration test
 +-- images/                 # gitignored default output dir (override via $T1_SOFTWARE_IMAGES_DIR)

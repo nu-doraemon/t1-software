@@ -140,13 +140,17 @@ mv "$LARTPC_SIF_SCRATCH" "$LARTPC_IMAGE"
 update_latest "$(basename "$BASE_IMAGE")" "$IMAGES_DIR/t1-base-${VARIANT}-latest.sif"
 write_manifest "$IMAGES_DIR/t1-base-${VARIANT}-${TAG}.manifest.json" \
     "torch_version=$(pin base/versions.env TORCH_VERSION)" \
-    "jax_version=$(pin base/versions.env JAX_VERSION)"
+    "jax_version=$(pin base/versions.env JAX_VERSION)" \
+    "root_version=$(pin base/versions.env ROOT_VERSION)" \
+    "geant4_version=$(pin base/versions.env GEANT4_VERSION)"
 
 update_latest "$(basename "$LARTPC_IMAGE")" "$IMAGES_DIR/t1-lartpc-${VARIANT}-latest.sif"
 write_manifest "$IMAGES_DIR/t1-lartpc-${VARIANT}-${TAG}.manifest.json" \
     "jaxtpc_commit=$(pin subgroups/lartpc/versions.env JAXTPC_COMMIT)" \
     "pimm_data_commit=$(pin subgroups/lartpc/versions.env PIMM_DATA_COMMIT)" \
-    "goop_commit=$(pin subgroups/lartpc/versions.env GOOP_COMMIT)"
+    "goop_commit=$(pin subgroups/lartpc/versions.env GOOP_COMMIT)" \
+    "dlpgenerator_commit=$(pin subgroups/lartpc/versions.env DLPGENERATOR_COMMIT)" \
+    "edepsim_commit=$(pin subgroups/lartpc/versions.env EDEPSIM_COMMIT)"
 
 echo "== done: ${BASE_IMAGE} ${LARTPC_IMAGE} =="
 echo "== latest: $IMAGES_DIR/t1-base-${VARIANT}-latest.sif $IMAGES_DIR/t1-lartpc-${VARIANT}-latest.sif =="
