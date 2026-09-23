@@ -143,6 +143,26 @@ export CMAKE_PREFIX_PATH="$G4ROOT_CONDA_PREFIX:${CMAKE_PREFIX_PATH:-}"
 SETUP_EOF
     chmod +x /opt/setup-g4root.sh
 
+    # Make bare `python3`/`python` resolve to the interpreter every install
+    # above actually targeted. Ubuntu 22.04's own `python3` package owns
+    # /usr/bin/python3 -> python3.10 (untouched below, on purpose --
+    # rewriting Ubuntu's own alternative would risk breaking dpkg/apt
+    # maintainer scripts that assume it, including subgroups/lartpc.def's
+    # own later `apt-get install` calls in this same image lineage).
+    # /usr/local/bin is searched before /usr/bin for every interactive
+    # shell and `apptainer exec <sif> python3 ...` invocation, so a plain
+    # symlink there shadows the untouched system default without editing
+    # it -- apt/dpkg's own scripts call python3 by absolute path, never
+    # through PATH, so they are unaffected. This is the permanent fix for
+    # the class of bug the docstring in
+    # subgroups/lartpc/tests/test_integration.py hit once already: a
+    # consumer typing bare `python3` (or `python`, which Ubuntu does not
+    # even provide by default) must never need to know this image pins
+    # 3.11, and must never silently land on a 3.10 interpreter that has
+    # none of the packages installed above.
+    ln -sf /usr/bin/python3.11 /usr/local/bin/python3
+    ln -sf /usr/bin/python3.11 /usr/local/bin/python
+
 %environment
     export PYTHONPATH=/opt
     export PYTHONDONTWRITEBYTECODE=1
@@ -151,6 +171,14 @@ SETUP_EOF
     python3.11 -c "import torch, jax; \
 print('torch', torch.__version__, 'cuda', torch.version.cuda); \
 print('jax', jax.__version__, 'devices', jax.devices())"
+
+    # Prove the /usr/local/bin shim above actually shadows Ubuntu's
+    # python3.10 default for bare `python3`/`python` -- the exact
+    # consumer-facing guarantee it exists for.
+    [ "$(command -v python3)" = /usr/local/bin/python3 ]
+    [ "$(command -v python)" = /usr/local/bin/python ]
+    python3 -c "import torch, jax; print('bare python3 ->', torch.__version__)"
+    python -c "import torch, jax; print('bare python ->', torch.__version__)"
 
     # Shared ROOT x GEANT4 layer: scoped activation (never the ambient
     # PATH above, see %post), proving the conda-forge install itself is

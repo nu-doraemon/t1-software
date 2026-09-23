@@ -9,7 +9,7 @@ hand-placed deposits -- no GPU, no out.h5 fixture file, no network.
 Deterministic: same deposits in, same signals out, every run.
 
     apptainer exec --nv images/t1-lartpc-cuda12-latest.sif \\
-        python3.11 /opt/t1-lartpc-tests/test_integration.py
+        python3 /opt/t1-lartpc-tests/test_integration.py
 
 
 Grounded against JAXTPC commit 806f9b3cced279314a3028b9bb4afba4104eca71's
