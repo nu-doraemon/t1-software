@@ -48,6 +48,20 @@ store rather than accepting the default. Re-running is idempotent per tag
 (see below): the same commit on the same day overwrites its own dated
 file, and always re-points the `-latest.sif` symlinks.
 
+## Runtime environment
+
+The image has one Python: conda-forge CPython 3.11 at `/opt/conda`,
+carrying Torch, JAX, PyROOT, and every subgroup package. It is active in
+every `apptainer exec/run/shell` with no setup step -- `python3`,
+`root`, `dlpgen`, `edep-sim`, and the Geant4 data variables all work
+directly.
+
+To *compile* against ROOT/Geant4 (e.g. rebuilding DLPGenerator or
+edep-sim yourself), first run `source /opt/setup-g4root.sh`. It adds only
+conda's compiler settings (`CC`/`CXX`/`CFLAGS`/`LDFLAGS`, matching the
+GCC ROOT was built with); these are kept out of the default environment
+so unrelated builds never pick them up.
+
 ## Image versioning
 
 Every image `nightly-build.sh` produces is named:

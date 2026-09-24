@@ -9,13 +9,10 @@
 #
 # Runs entirely on CPU with a single low-multiplicity interaction (one
 # muon) fired into edep-sim's own inputs/example.gdml -- no GPU, no
-# network, deterministic (fixed SEED). The generation half needs the
-# shared ROOT/GEANT4 conda-forge layer + DLPGenerator's own build tree, so
-# it runs in a scoped subshell that sources /opt/setup-g4root.sh (exactly
-# like edep-sim's/DLPGenerator's own upstream docs expect); the resulting
-# HDF5 file is then read back with the system python3.11 + h5py already
-# used by pimm-data, proving the seam doesn't require PyROOT on the
-# consuming side.
+# network, deterministic (fixed SEED). Uses only the image's default
+# environment (no setup script): generation via dlpgen + edep-sim, then
+# the HDF5 output read back with h5py, proving the seam works for a
+# plain `apptainer exec` user.
 #
 # Grounded against DLPGenerator commit 7b13a2a88d4f7a214ac84b53a66640392a50aec7's
 # own python/dlp_generator/cli.py::_write_bomb_macro and
@@ -51,8 +48,6 @@ YAML
 OUT_H5="$WORKDIR/out.h5"
 
 (
-    set -eu
-    source /opt/setup-g4root.sh
     cd "$WORKDIR"
 
     dlpgen bomb.yaml 3 --format bomb-macro --output bomb.mac
@@ -70,7 +65,7 @@ OUT_H5="$WORKDIR/out.h5"
     edep-sim -C -u -g "$EXAMPLE_GDML" -o "$OUT_H5" bomb.mac
 )
 
-/usr/bin/python3.11 - "$OUT_H5" <<'PY'
+python3 - "$OUT_H5" <<'PY'
 import sys
 
 import h5py

@@ -5,8 +5,9 @@ From: {{ BASE_SIF }}
 # (detector simulation), pimm-data (HDF5 dataset loader), goop
 # (differentiable PMT/light-readout simulation), and DLPGenerator +
 # edep-sim (event generation -> Geant4 energy-deposition simulation),
-# each pinned independently of each other and of the shared Torch/JAX
-# and ROOT/GEANT4 bases.
+# each pinned independently of each other and of the shared base. All
+# Python packages install into the base image's single /opt/conda
+# python3 (Torch/JAX/PyROOT share it).
 #
 # goop has no setup.py/pyproject -- upstream runs it from source via
 # PYTHONPATH, not `pip install`, so only its runtime deps are installed
@@ -30,20 +31,22 @@ From: {{ BASE_SIF }}
     apt-get install -y --no-install-recommends git
     rm -rf /var/lib/apt/lists/*
 
-    # goop's own runtime pins (its environment.yml), installed before
-    # JAXTPC/pimm-data below so their unbounded `numpy` requirement is
-    # satisfied by this pin instead of the other way around -- pip never
-    # upgrades an already-satisfied unbounded dependency, so pinning
-    # numpy<2 first keeps it <2 for the rest of this image's installs.
-    # jax 0.6.2 (base layer) only requires numpy>=1.26, so this stays
-    # compatible with the shared base. pytest-benchmark is not in
-    # environment.yml but IS required just to parse goop's own
-    # pytest.ini (`addopts = --benchmark-skip` fails at argument-parsing
-    # time, before any test runs, if the plugin providing that flag is
-    # absent) -- installed here too so `pytest /opt/goop/tests` below
-    # works at all.
-    python3.11 -m pip install --no-cache-dir \
-        "numpy<2" scipy h5py pyyaml matplotlib tqdm pytest pytest-benchmark
+    export MAMBA_ROOT_PREFIX=/opt/micromamba
+    PY=/opt/conda/bin/python3
+    # Compiled/native deps from conda-forge into the shared prefix, so
+    # they link the same libstdc++/HDF5 as ROOT/GEANT4 (h5py, numpy
+    # already come from base). yaml-cpp/cmake/make: edep-sim's build
+    # toolchain, matching conda's compiler (no apt build-essential mixing
+    # Ubuntu headers into conda's sysroot). --freeze-installed keeps the
+    # base pins (numpy, python, root_base) untouched. cmake<4: edep-sim's
+    # cmake_minimum_required predates 3.5, which CMake 4 refuses.
+    micromamba install -y -p /opt/conda -c conda-forge --override-channels \
+        --freeze-installed matplotlib tqdm pytest pytest-benchmark \
+        pywavelets yaml-cpp "cmake<4" make
+    micromamba clean -y -a
+
+    # pytest-benchmark (above) is required just to parse goop's own
+    # pytest.ini (`addopts = --benchmark-skip`).
 
     mkdir -p /opt
     cd /opt
@@ -51,35 +54,24 @@ From: {{ BASE_SIF }}
     cd JAXTPC
     git checkout --quiet {{ JAXTPC_COMMIT }}
     # JAXTPC's own requirements.txt is bounded (jax>=0.4,<0.7) so it never
-    # clobbers the base image's JAX pin; Torch is not in this file at all
-    # (base already installed it, and must stay untouched by this step).
-    python3.11 -m pip install --no-cache-dir -r requirements.txt
+    # clobbers the base image's JAX pin; Torch is not in this file at all.
+    $PY -m pip install --no-cache-dir -r requirements.txt
 
     cd /opt
     git clone --quiet https://github.com/omaralterkait/pimm-data.git
     cd pimm-data
     git checkout --quiet {{ PIMM_DATA_COMMIT }}
-    # pimm-data is not LArTPC-specific and installs on top of the shared
-    # base without pulling its own Torch (its pyproject deliberately
-    # excludes torch from its dependency list, so this install can never
-    # silently reinstall a different Torch build). Editable (`-e`), per
-    # pyproject.toml's own "editable install must not pull a different
-    # CUDA build" comment -- a regular `pip install .` build excludes
-    # src/pimm_data/data/*.json (no package-data/MANIFEST.in declared
-    # upstream), which breaks its own plane-geometry lookups; editable
-    # keeps the package pointed at this checkout's data/ dir instead.
-    # `.[test]` pulls its own pytest extra so its suite is runnable
-    # in-image below. pywavelets is a real runtime dependency of its
-    # readers/coeff_tpc.py wavelet-coefficient reader, exercised by its
-    # own test_coeff_dataset.py, but missing from pyproject.toml's
-    # dependency list -- installed explicitly to cover that gap.
-    python3.11 -m pip install --no-cache-dir -e .[test] pywavelets
+    # pimm-data excludes torch from its dependency list, so this install
+    # never reinstalls a different Torch build. Editable (`-e`): a regular
+    # `pip install .` omits src/pimm_data/data/*.json (no package-data
+    # declared upstream), breaking its plane-geometry lookups. `.[test]`
+    # pulls its pytest extra so its suite is runnable in-image below.
+    $PY -m pip install --no-cache-dir -e .[test]
 
     cd /opt
     # Non-recursive clone -- see header comment: goop/jaxtpc stays an
-    # empty, uninitialized submodule directory on purpose. goop itself is
-    # not pip-installed (no setup.py/pyproject); it stays plain source on
-    # disk and is added to PYTHONPATH below.
+    # empty, uninitialized submodule directory on purpose. goop is plain
+    # source on PYTHONPATH (no setup.py/pyproject upstream).
     git clone --quiet https://github.com/CIDeR-ML/goop.git
     cd goop
     git checkout --quiet {{ GOOP_COMMIT }}
@@ -88,23 +80,11 @@ From: {{ BASE_SIF }}
     # edep-sim (drinkingkazu's fork -- adds src/kinem/ParticleBombGenerator,
     # which links DLPGenerator's ParticleBomb directly into edep-sim's own
     # "/generator/kinematics/set bomb" seam, so the build order below is
-    # load-bearing, not incidental). Both need the shared base's ROOT +
-    # GEANT4 conda-forge layer (base/versions.env), scoped to this one
-    # subshell exactly like edep-sim's/DLPGenerator's own upstream docs
-    # expect ("source thisroot.sh" / "source geant4.sh") -- never this
-    # image's ambient PATH/LD_LIBRARY_PATH, which stays Torch x JAX's.
-    apt-get update
-    apt-get install -y --no-install-recommends build-essential cmake libyaml-cpp-dev
-    rm -rf /var/lib/apt/lists/*
-
-    # apptainer runs %post under /bin/sh (dash): `source` is a bash
-    # builtin, and DLPGenerator's own setup.sh uses bash-only syntax
-    # (`${BASH_SOURCE[0]}`, `[[ ]]`) that dash cannot parse at all, so
-    # this whole block needs a real bash, not just `.` swapped in for
-    # dash's own `source`-less semantics. No `-u` (nounset): both
-    # setup-g4root.sh's conda activate.d hooks and DLPGenerator's own
-    # setup.sh (checks $FORCE_DLPGENERATOR_DIR before it is ever set)
-    # reference optional variables in ways that are not nounset-safe.
+    # load-bearing). Built with conda's own compiler via
+    # /opt/setup-g4root.sh -- the same GCC series ROOT/GEANT4 were built
+    # with. bash, not %post's /bin/sh: DLPGenerator's setup.sh is
+    # bash-only (`${BASH_SOURCE[0]}`, `[[ ]]`). No `-u`: neither
+    # setup.sh nor conda's hooks are nounset-safe.
     bash <<'GEN_BUILD_EOF'
 set -e
 source /opt/setup-g4root.sh
@@ -113,18 +93,13 @@ cd /opt
 git clone --quiet https://github.com/DeepLearnPhysics/DLPGenerator.git
 cd DLPGenerator
 git checkout --quiet {{ DLPGENERATOR_COMMIT }}
-# Upstream's own setup.sh: checks rootcling is on PATH (satisfied by
-# sourcing setup-g4root.sh above) and exports
-# DLPGENERATOR_DIR/BINDIR/LIBDIR/INCDIR -- edep-sim's cmake below reads
-# DLPGENERATOR_INCDIR/LIBDIR from the environment directly, so this must
-# stay sourced (not a subshell of its own) through edep-sim's build
-# later in this same script.
+# Upstream's setup.sh exports DLPGENERATOR_{DIR,LIBDIR,INCDIR,...};
+# edep-sim's cmake below reads DLPGENERATOR_INCDIR/LIBDIR from the
+# environment, so it stays sourced through edep-sim's build.
 source setup.sh
 make
-# Rebuilds + runs the upstream pytest suite through PyROOT -- proves the
-# built ParticleBomb dictionary is loadable and its multiplicity/weight
-# logic matches upstream's own expectations (ROADMAP.md "Tests" item),
-# the same convention as JAXTPC/pimm-data/goop's suites re-run below.
+# Upstream pytest suite through PyROOT: proves the ParticleBomb
+# dictionary loads and its multiplicity/weight logic holds.
 make test
 chmod +x bin/dlpgen
 
@@ -133,112 +108,59 @@ git clone --quiet https://github.com/drinkingkazu/edep-sim.git
 cd edep-sim
 git checkout --quiet {{ EDEPSIM_COMMIT }}
 mkdir -p build && cd build
-# EDEPSIM_DISPLAY=OFF: skips the standalone ROOT/G4 event-display GUI
-# (display/CMakeLists.txt) -- an interactive-only convenience this
-# headless data-challenge image never launches, and one fewer
-# dependency surface (Xpm/Xft GUI libs) to carry. RPATH flags bake
-# edep-sim's own install lib dir (for libedepsim.so/libedepsim_io.so),
-# the conda-g4 lib dir, and DLPGenerator's build/lib straight into the
-# installed `edep-sim` binary, so running it later never needs
-# setup-g4root.sh sourced -- only building it, and only PyROOT-based
-# tools (dlpgen), still do.
-#
-# `yaml-cpp_DIR` (see the comment on the `libyaml-cpp-dev` apt-get
-# install above) locates apt's config-mode package at all, since
-# conda-g4's cross toolchain triplet skips Debian's multiarch search
-# path. That gets find_package(yaml-cpp CONFIG) to succeed and link
-# correctly, but edep-sim's own src/CMakeLists.txt separately reads
-# `${YAML_CPP_INCLUDE_DIR}` for its headers -- a pre-target-based-config
-# yaml-cpp convention (yaml-cpp <0.7) that this apt package's own
-# yaml-cpp-config.cmake unconditionally resets to empty
-# (`set(YAML_CPP_INCLUDE_DIR "")`, a legacy compatibility stub predating
-# its real target-based INTERFACE_INCLUDE_DIRECTORIES), so passing it
-# via -D is silently overwritten and never reaches the actual compile.
-# `-idirafter /usr/include` sidesteps that broken variable entirely by
-# adding the real header location as a compiler flag instead of a cmake
-# variable. `-idirafter` (searched only after every other -I/-isystem
-# path, including conda-g4's own sysroot) rather than plain `-I`: this
-# compiler is conda-g4's own relocated cross toolchain with its own
-# bundled glibc headers, and a plain `-I/usr/include` searched earlier
-# leaks Ubuntu's glibc headers (e.g. features.h) ahead of that sysroot's
-# matching set, breaking unrelated Geant4 headers that transitively
-# expect the sysroot's own split glibc files (e.g. bits/timesize.h).
-cmake \
+# EDEPSIM_DISPLAY=OFF: skips the interactive ROOT/G4 event-display GUI.
+# RPATH bakes edep-sim's own lib dir, /opt/conda/lib, and DLPGenerator's
+# build/lib into the installed binary. yaml-cpp comes from conda
+# (above), whose include dir is already on conda's -isystem CXXFLAGS.
+cmake $CMAKE_ARGS \
     -DCMAKE_INSTALL_PREFIX=/opt/edep-sim-install \
     -DCMAKE_PREFIX_PATH="$CMAKE_PREFIX_PATH" \
     -DEDEPSIM_DISPLAY=OFF \
-    -DCMAKE_INSTALL_RPATH="/opt/edep-sim-install/lib;$G4ROOT_CONDA_PREFIX/lib;$DLPGENERATOR_LIBDIR" \
+    -DCMAKE_INSTALL_RPATH="/opt/edep-sim-install/lib;$CONDA_PREFIX/lib;$DLPGENERATOR_LIBDIR" \
     -DCMAKE_BUILD_WITH_INSTALL_RPATH=TRUE \
     -DCMAKE_INSTALL_RPATH_USE_LINK_PATH=TRUE \
-    -Dyaml-cpp_DIR=/usr/lib/x86_64-linux-gnu/cmake/yaml-cpp \
-    -DCMAKE_CXX_FLAGS="-idirafter /usr/include" \
     ..
 make -j"$(nproc)"
 make install
 GEN_BUILD_EOF
 
-    # One `source /opt/setup-g4root.sh` for the whole generator toolchain:
-    # base/base.def wrote the ROOT/GEANT4 activation there; append this
-    # overlay's own DLPGenerator env (mirrors DLPGenerator's own
-    # setup.sh) plus edep-sim's install tree, rather than a second,
-    # separately-documented script.
-    cat >> /opt/setup-g4root.sh <<'SETUP_EOF'
-
-# subgroups/lartpc overlay additions -- DLPGenerator + edep-sim.
-export DLPGENERATOR_DIR=/opt/DLPGenerator
-export DLPGENERATOR_BINDIR="$DLPGENERATOR_DIR/bin"
-export DLPGENERATOR_BUILDDIR="$DLPGENERATOR_DIR/build"
-export DLPGENERATOR_LIBDIR="$DLPGENERATOR_BUILDDIR/lib"
-export DLPGENERATOR_INCDIR="$DLPGENERATOR_BUILDDIR/include"
-export PATH="$DLPGENERATOR_BINDIR:$PATH"
-export LD_LIBRARY_PATH="$DLPGENERATOR_LIBDIR:$LD_LIBRARY_PATH"
-export PYTHONPATH="$DLPGENERATOR_DIR/python:${PYTHONPATH:-}"
-export ROOT_INCLUDE_PATH="$DLPGENERATOR_INCDIR/DLPGenerator/ParticleBomb:${ROOT_INCLUDE_PATH:-}"
-export EDEPSIM_ROOT=/opt/edep-sim-install
-export PATH="$EDEPSIM_ROOT/bin:$PATH"
-SETUP_EOF
-
 %environment
-    export PYTHONPATH=/opt/JAXTPC:/opt/goop:$PYTHONPATH
-
-    # edep-sim's own RPATH (baked in at cmake-configure time above) makes
-    # the binary runnable from PATH alone -- no LD_LIBRARY_PATH or
-    # setup-g4root.sh needed for this one executable, unlike dlpgen/
-    # PyROOT (see /opt/setup-g4root.sh, appended above).
-    export PATH=/opt/edep-sim-install/bin:$PATH
+    # DLPGenerator runtime env (mirrors its own setup.sh) + edep-sim, so
+    # dlpgen / PyROOT's ParticleBomb / edep-sim work in every session
+    # with no manual setup step.
+    export DLPGENERATOR_DIR=/opt/DLPGenerator
+    export DLPGENERATOR_BINDIR=$DLPGENERATOR_DIR/bin
+    export DLPGENERATOR_BUILDDIR=$DLPGENERATOR_DIR/build
+    export DLPGENERATOR_LIBDIR=$DLPGENERATOR_BUILDDIR/lib
+    export DLPGENERATOR_INCDIR=$DLPGENERATOR_BUILDDIR/include
+    export LD_LIBRARY_PATH=$DLPGENERATOR_LIBDIR:$LD_LIBRARY_PATH
+    export ROOT_INCLUDE_PATH=$DLPGENERATOR_INCDIR/DLPGenerator/ParticleBomb:$ROOT_INCLUDE_PATH
+    export EDEPSIM_ROOT=/opt/edep-sim-install
+    export PATH=$EDEPSIM_ROOT/bin:$DLPGENERATOR_BINDIR:$PATH
+    export PYTHONPATH=/opt/JAXTPC:/opt/goop:$DLPGENERATOR_DIR/python:$PYTHONPATH
 
 %files
     subgroups/lartpc/tests/ /opt/t1-lartpc-tests
 
 %test
-    python3.11 -c "\
-import sys; sys.path.insert(0, '/opt/JAXTPC'); \
+    set -e
+    python3 -c "\
+import ROOT, torch, jax; \
 from tools.geometry import generate_detector; \
 from tools.simulation import DetectorSimulator; \
-import pimm_data; \
-sys.path.insert(0, '/opt/goop'); \
-import goop; \
-print('JAXTPC + pimm-data + goop import OK')"
-    python3.11 /opt/t1-lartpc-tests/test_integration.py
+import pimm_data, goop, dlp_generator; \
+print('JAXTPC + pimm-data + goop + DLPGenerator + PyROOT import OK')"
+    python3 /opt/t1-lartpc-tests/test_integration.py
 
-    # Re-run each vendored package's own unit-test suite in-image
-    # (ROADMAP.md "Tests" item) rather than trusting the import check
-    # alone. All three suites self-skip GPU/asset-dependent cases (real
-    # photon-library lookups, SIREN checkpoints, --nv-only paths), so
-    # they stay green on the CPU-only, no-GPU host this script builds on.
-    # JAXTPC's own tests resolve their config fixtures with a path
-    # relative to cwd (e.g. `config/cubic_wireplane_config.yaml`, read
-    # relative to /opt/JAXTPC, not to the test file's own directory) --
-    # `%test`'s cwd is whatever the host's `apptainer test` invocation
-    # cwd happened to be, so this must `cd` into JAXTPC's own repo root
-    # first. A subshell keeps that `cd` from leaking into the
-    # pimm-data/goop suites below, which are both cwd-independent.
+    # Re-run each vendored package's own unit suite in-image. All three
+    # self-skip GPU/asset-dependent cases. JAXTPC's tests resolve config
+    # fixtures relative to cwd, hence the subshell `cd`.
     echo "== JAXTPC unit suite =="
-    (cd /opt/JAXTPC && JAX_PLATFORM_NAME=cpu python3.11 -m pytest -q tests)
+    (cd /opt/JAXTPC && JAX_PLATFORM_NAME=cpu python3 -m pytest -q -p no:cacheprovider tests)
     echo "== pimm-data unit suite =="
-    python3.11 -m pytest -q /opt/pimm-data/tests
+    python3 -m pytest -q -p no:cacheprovider /opt/pimm-data/tests
     echo "== goop unit suite =="
-    python3.11 -m pytest -q /opt/goop/tests
+    python3 -m pytest -q -p no:cacheprovider /opt/goop/tests
 
     echo "== DLPGenerator + edep-sim seam (bomb-macro -> H5DLP) =="
     bash /opt/t1-lartpc-tests/test_generator_edepsim.sh

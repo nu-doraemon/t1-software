@@ -1,7 +1,7 @@
 Bootstrap: docker
 From: nvidia/cuda:12.9.1-cudnn-devel-ubuntu22.04
 
-# t1-base -- shared Torch x JAX layer for all T1-LArTPC subgroups. No
+# t1-base -- shared Torch x JAX + ROOT x GEANT4 layer (one conda python) for all T1-LArTPC subgroups. No
 # subgroup-specific package (JAXTPC, pimm-data, LUCiD, ...) belongs in
 # this image -- add those in subgroups/<name>/*.def instead, layered on
 # top via `Bootstrap: localimage`.
@@ -12,183 +12,147 @@ From: nvidia/cuda:12.9.1-cudnn-devel-ubuntu22.04
 %post
     set -eu
     apt-get update
-    apt-get install -y --no-install-recommends \
-        python3.11 python3.11-venv python3-pip curl ca-certificates
+    apt-get install -y --no-install-recommends curl ca-certificates
     rm -rf /var/lib/apt/lists/*
-    python3.11 -m pip install --no-cache-dir --upgrade pip
 
-    # Torch pinned FIRST via its own CUDA-tagged index -- installing JAX
-    # (or anything else) before this must never be allowed to pull a
-    # different Torch build. pip resolves against whatever is already
-    # installed, so later installs (JAX here, or a subgroup's own
-    # dependencies) must never be allowed to reinstall/upgrade torch to a
-    # non-CUDA-tagged wheel.
-    python3.11 -m pip install --no-cache-dir \
-        "torch=={{ TORCH_VERSION }}" --index-url {{ TORCH_INDEX_URL }}
-
-    # JAX CPU/GPU wheel bundle (installs nvidia-cuda-runtime, nvidia-cudnn-cu12,
-    # nvidia-cusolver-cu12, etc. from PyPI -- CUDA 12 only; do not pass the
-    # cuda13 extra here since this def only ever produces the cuda12 variant
-    # until a cuda13-capable driver host exists to build and verify it).
-    python3.11 -m pip install --no-cache-dir "jax[cuda12]=={{ JAX_VERSION }}"
-
-    # Ubuntu 22.04's apt python3.11 package is frozen at 3.11.0rc1 (see
-    # `python3.11 --version`), which predates CPython's late-added
-    # int<->str conversion digit-limit guard (gh-95778,
-    # sys.get_int_max_str_digits/set_int_max_str_digits). torch._dynamo's
-    # own sys polyfill (torch/_dynamo/polyfills/sys.py) references both
-    # unconditionally whenever sys.version_info >= (3, 11) -- true even
-    # for this rc build -- so ANY code path that imports torch._dynamo
-    # (e.g. torch.utils.checkpoint's default non-reentrant mode, used by
-    # goop's differentiable TOF sampler) crashes with AttributeError.
-    # /usr/lib/python3.11 precedes site-packages on sys.path, so Ubuntu's
-    # own sitecustomize.py there (apport exception-hook install) is the
-    # one `site` actually imports at startup -- append to it (not a
-    # sitecustomize.py of our own under dist-packages, which would be
-    # shadowed and silently never run) so the polyfill takes effect for
-    # every python3.11 invocation in this image; polyfill with the real
-    # feature's documented default (4300) and no actual enforcement,
-    # matching this rc build's pre-feature behavior -- a pure addition,
-    # never touched if a future base image ships a python3.11 final
-    # release that already has it.
-    cat >> /usr/lib/python3.11/sitecustomize.py <<'EOF'
-import sys
-if not hasattr(sys, "get_int_max_str_digits"):
-    sys._int_max_str_digits = 4300
-
-    def get_int_max_str_digits():
-        return sys._int_max_str_digits
-
-    def set_int_max_str_digits(maxdigits):
-        if not isinstance(maxdigits, int):
-            raise TypeError("maxdigits must be an int")
-        sys._int_max_str_digits = maxdigits
-
-    sys.get_int_max_str_digits = get_int_max_str_digits
-    sys.set_int_max_str_digits = set_int_max_str_digits
-EOF
-
-    # Shared ROOT x GEANT4 layer (base/versions.env "Shared ROOT x GEANT4
-    # layer" comment) -- conda-forge prebuilt binaries via micromamba
-    # into an isolated prefix; building either from source in a fakeroot
-    # apptainer %post would take hours. Deliberately NOT added to this
-    # %environment's PATH/LD_LIBRARY_PATH below: root_base's own PyROOT
-    # build carries its own CPython 3.11, and prepending or appending its
-    # lib dir globally would risk exactly the "two native stacks fighting
-    # over the dynamic linker" problem already solved for Torch x JAX
-    # above -- ROOT/GEANT4's own OpenSSL/zlib/libstdc++ must never shadow
-    # what python3.11's CUDA wheels expect. A subgroup that needs to
-    # build or run ROOT/GEANT4-based tools sources
-    # /opt/setup-g4root.sh in its own scoped shell first, the same way
-    # edep-sim's and DLPGenerator's own upstream docs already expect
-    # `source thisroot.sh` / `source geant4.sh` before use.
+    # ONE Python for the whole image: conda-forge's CPython 3.11 at
+    # /opt/conda, shared by PyROOT (root_base's own py311 build) and the
+    # pip-installed Torch x JAX stack below. Two interpreters (Ubuntu's
+    # apt python3.11 for Torch/JAX + a separate conda python for PyROOT)
+    # meant bare `python3` could only ever serve one of them -- e.g.
+    # DLPGenerator's `#!/usr/bin/env python3` dlpgen needs `import ROOT`
+    # while every Torch/JAX consumer needs the other interpreter -- so the
+    # two stacks now live in one prefix. ROOT/GEANT4 come from conda-forge
+    # (prebuilt; building either from source in a fakeroot %post would
+    # take hours), Torch/JAX from their own CUDA-tagged pip wheels.
+    # micromamba is kept in the image (single static binary) so subgroup
+    # overlays can add their own conda-forge packages into this prefix.
     curl -fsSL -o /usr/local/bin/micromamba \
         "https://github.com/mamba-org/micromamba-releases/releases/download/{{ MICROMAMBA_VERSION }}/micromamba-linux-64"
     echo "{{ MICROMAMBA_SHA256 }}  /usr/local/bin/micromamba" | sha256sum -c -
     chmod +x /usr/local/bin/micromamba
 
-    # `expat` pinned explicitly, not left to solve in transitively: geant4's
-    # own conda-forge runtime dependency only pulls in `libexpat` (the
-    # shared library), never the `expat` dev subpackage (headers,
-    # unversioned .so, CMake config) a downstream consumer building
-    # against GEANT4 -- edep-sim, subgroups/lartpc/lartpc.def -- needs for
-    # its own `find_package(EXPAT)` to succeed. `hdf5` added for the same
-    # reason: neither root_base nor geant4 pulls it in on their own, but
-    # edep-sim's C++ H5DLP persistence layer (its own `find_package(HDF5)`,
-    # the seam DLPGenerator's bomb-macro -> H5 output round-trips through
-    # with pimm-data) needs the real library + headers built against this
-    # same conda-g4 toolchain -- pimm-data's own h5py (python3.11
-    # dist-packages) is a separate stack that never satisfies a C++ link.
-    micromamba create -y -p /opt/conda-g4 -c conda-forge --override-channels \
+    # gxx_linux-64 pinned to the GCC series root_base was built with:
+    # cling compares the libstdc++ headers it parses at runtime against
+    # the __GLIBCXX__ it was compiled with, and an unpinned solve pulls a
+    # newer gcc point release, giving a (harmless but alarming)
+    # "Possible C++ standard library mismatch" warning on every rootcling
+    # / PyROOT start. `numpy>=2`: JAXTPC uses numpy-2-only API
+    # (np.trapezoid); conda owns numpy so pip never swaps it under
+    # root_base's compiled bindings. `expat`/`hdf5`/`h5py`: geant4
+    # only pulls the libexpat runtime, not the headers/CMake config
+    # edep-sim's find_package(EXPAT) needs; hdf5 is edep-sim's H5DLP
+    # C++ output layer, and h5py must link that same libhdf5 so Python
+    # readers and the C++ writer share one HDF5 build.
+    export MAMBA_ROOT_PREFIX=/opt/micromamba
+    micromamba create -y -p /opt/conda -c conda-forge --override-channels \
+        "python={{ PYTHON_VERSION }}" \
         "root_base={{ ROOT_VERSION }}" \
         "geant4={{ GEANT4_VERSION }}={{ GEANT4_BUILD_VARIANT }}" \
-        expat hdf5 numpy pyyaml
+        "gxx_linux-64={{ GXX_VERSION }}" \
+        "numpy>=2" scipy expat hdf5 h5py pyyaml pip
     micromamba clean -y -a
-    rm -f /usr/local/bin/micromamba
+
+    # One libstdc++ per process: torch's wheel resolves libstdc++.so.6
+    # through the system search path (Ubuntu's GCC 11 copy), and once
+    # that is loaded ROOT's libCling/libcppyy_backend (GCC 14, need
+    # GLIBCXX_3.4.31) fail with "could not load cppyy_backend library"
+    # whenever torch is imported before ROOT. Register conda's newer
+    # libstdc++/libgcc_s ahead of the system dir image-wide -- libstdc++
+    # is backward compatible, so every Ubuntu binary keeps working -- via
+    # a directory holding only those two libraries (NOT all of
+    # /opt/conda/lib, whose OpenSSL/zlib/etc. must never shadow Ubuntu's).
+    mkdir -p /opt/conda/lib-runtime
+    ln -sf /opt/conda/lib/libstdc++.so.6 /opt/conda/lib-runtime/libstdc++.so.6
+    ln -sf /opt/conda/lib/libgcc_s.so.1 /opt/conda/lib-runtime/libgcc_s.so.1
+    echo /opt/conda/lib-runtime > /etc/ld.so.conf.d/000-conda-libstdcxx.conf
+    ldconfig
+    ldconfig -p | grep -m1 'libstdc++.so.6 ' | grep -q /opt/conda/lib-runtime
+
+    PY=/opt/conda/bin/python3
+    # Torch pinned FIRST via its own CUDA-tagged index -- installing JAX
+    # (or anything else) before this must never be allowed to pull a
+    # different Torch build; later installs resolve against it.
+    $PY -m pip install --no-cache-dir \
+        "torch=={{ TORCH_VERSION }}" --index-url {{ TORCH_INDEX_URL }}
+    # JAX CUDA 12 wheel bundle (nvidia-* runtime libs from PyPI).
+    $PY -m pip install --no-cache-dir "jax[cuda12]=={{ JAX_VERSION }}"
+
+    # Runtime activation, sourced by %environment (so every
+    # `apptainer exec/run/shell` gets it -- no manual setup step): PATH,
+    # ROOTSYS, the G4*DATA dataset vars, etc. from conda's own
+    # activate.d hooks. The compiler hooks (gcc/gxx/binutils) are
+    # deliberately skipped here: they export CC/CXX/CFLAGS/LDFLAGS for
+    # conda's cross toolchain, which would silently hijack every unrelated
+    # build (`pip install` of an sdist, a user's own make). Those are
+    # opt-in via /opt/setup-g4root.sh below. POSIX sh (apptainer sources
+    # %environment with /bin/sh).
+    cat > /opt/conda/etc/t1-runtime.sh <<'RUNTIME_EOF'
+export CONDA_PREFIX=/opt/conda
+# cling (PyROOT, rootcling) locates glibc headers through this; without
+# it `import ROOT` fails with "'assert.h' file not found". Normally set by
+# the gcc hook skipped below; it is a path, not a compiler flag.
+export CONDA_BUILD_SYSROOT="$CONDA_PREFIX/x86_64-conda-linux-gnu/sysroot"
+for f in "$CONDA_PREFIX"/etc/conda/activate.d/*.sh; do
+    case "$f" in *gcc_linux*|*gxx_linux*|*binutils_linux*) continue ;; esac
+    # geant4-data hooks warn when their var is already set (nested exec).
+    [ -e "$f" ] && . "$f" >/dev/null 2>&1
+done
+unset f
+case ":$PATH:" in *":$CONDA_PREFIX/bin:"*) ;; *) PATH="$CONDA_PREFIX/bin:$PATH" ;; esac
+export PATH
+RUNTIME_EOF
 
     cat > /opt/setup-g4root.sh <<'SETUP_EOF'
 #!/usr/bin/env bash
-# Activates the shared ROOT + GEANT4 conda-forge environment
-# (base/versions.env ROOT_VERSION / GEANT4_VERSION) for building or
-# running the Geant4-based tools layered on top of it (currently
-# DLPGenerator + edep-sim, subgroups/lartpc/lartpc.def). NOT sourced by
-# %environment or any %post step outside this scoped use -- see the
-# comment beside where this file is written in base/base.def.
+# Build-toolchain activation for compiling against ROOT/GEANT4 in this
+# image (e.g. DLPGenerator, edep-sim). The runtime environment (python3,
+# PyROOT, root, geant4 data) is already active in every apptainer
+# session; this adds only conda's compiler settings (CC/CXX/CFLAGS/
+# LDFLAGS/CMAKE_ARGS for the GCC ROOT itself was built with), kept out of
+# the default environment so unrelated builds never pick them up.
 #
 #   source /opt/setup-g4root.sh
 #
-export G4ROOT_CONDA_PREFIX="${G4ROOT_CONDA_PREFIX:-/opt/conda-g4}"
-
-# geant4-data-* conda packages (G4NDL, G4EMLOW, ...) set their own
-# G4*DATA env vars via conda activate.d hooks; run those directly instead
-# of pulling in micromamba's full shell-hook machinery for a prefix this
-# image never swaps out. These third-party scripts assume the real
-# `conda activate` has already exported CONDA_PREFIX, and are not
-# written to be `set -u` (nounset) safe (e.g. the gcc_linux-64 compiler
-# activation script root_base pulls in) -- export CONDA_PREFIX
-# ourselves and relax nounset only for this loop, restoring it
-# afterward so a caller's own `set -eu` is unaffected past this point.
-export CONDA_PREFIX="$G4ROOT_CONDA_PREFIX"
+export G4ROOT_CONDA_PREFIX=/opt/conda
+. /opt/conda/etc/t1-runtime.sh
+# Third-party hooks are not nounset-safe; relax -u just for them.
 case "$-" in *u*) _g4root_had_nounset=1 ;; *) _g4root_had_nounset=0 ;; esac
 set +u
-for f in "$G4ROOT_CONDA_PREFIX"/etc/conda/activate.d/*.sh; do
-    [ -e "$f" ] && . "$f"
+for f in "$CONDA_PREFIX"/etc/conda/activate.d/*.sh; do
+    case "$f" in *gcc_linux*|*gxx_linux*|*binutils_linux*) . "$f" ;; esac
 done
+unset f
 [ "$_g4root_had_nounset" = 1 ] && set -u
 unset _g4root_had_nounset
-
-export PATH="$G4ROOT_CONDA_PREFIX/bin:$PATH"
-export LD_LIBRARY_PATH="$G4ROOT_CONDA_PREFIX/lib:${LD_LIBRARY_PATH:-}"
-export CMAKE_PREFIX_PATH="$G4ROOT_CONDA_PREFIX:${CMAKE_PREFIX_PATH:-}"
+export CMAKE_PREFIX_PATH="$CONDA_PREFIX:${CMAKE_PREFIX_PATH:-}"
 SETUP_EOF
     chmod +x /opt/setup-g4root.sh
 
-    # Make bare `python3`/`python` resolve to the interpreter every install
-    # above actually targeted. Ubuntu 22.04's own `python3` package owns
-    # /usr/bin/python3 -> python3.10 (untouched below, on purpose --
-    # rewriting Ubuntu's own alternative would risk breaking dpkg/apt
-    # maintainer scripts that assume it, including subgroups/lartpc.def's
-    # own later `apt-get install` calls in this same image lineage).
-    # /usr/local/bin is searched before /usr/bin for every interactive
-    # shell and `apptainer exec <sif> python3 ...` invocation, so a plain
-    # symlink there shadows the untouched system default without editing
-    # it -- apt/dpkg's own scripts call python3 by absolute path, never
-    # through PATH, so they are unaffected. This is the permanent fix for
-    # the class of bug the docstring in
-    # subgroups/lartpc/tests/test_integration.py hit once already: a
-    # consumer typing bare `python3` (or `python`, which Ubuntu does not
-    # even provide by default) must never need to know this image pins
-    # 3.11, and must never silently land on a 3.10 interpreter that has
-    # none of the packages installed above.
-    ln -sf /usr/bin/python3.11 /usr/local/bin/python3
-    ln -sf /usr/bin/python3.11 /usr/local/bin/python
-
 %environment
+    . /opt/conda/etc/t1-runtime.sh
     export PYTHONPATH=/opt
     export PYTHONDONTWRITEBYTECODE=1
 
 %test
-    python3.11 -c "import torch, jax; \
+    # apptainer runs %test without -e; a failed check must fail the build.
+    set -e
+    # Bare python3 must be the one interpreter carrying every stack.
+    [ "$(command -v python3)" = /opt/conda/bin/python3 ]
+    [ "$(command -v python)" = /opt/conda/bin/python ]
+    # torch imported BEFORE ROOT on purpose: the libstdc++ ordering case.
+    python3 -c "import torch, jax, ROOT; \
 print('torch', torch.__version__, 'cuda', torch.version.cuda); \
-print('jax', jax.__version__, 'devices', jax.devices())"
-
-    # Prove the /usr/local/bin shim above actually shadows Ubuntu's
-    # python3.10 default for bare `python3`/`python` -- the exact
-    # consumer-facing guarantee it exists for.
-    [ "$(command -v python3)" = /usr/local/bin/python3 ]
-    [ "$(command -v python)" = /usr/local/bin/python ]
-    python3 -c "import torch, jax; print('bare python3 ->', torch.__version__)"
-    python -c "import torch, jax; print('bare python ->', torch.__version__)"
-
-    # Shared ROOT x GEANT4 layer: scoped activation (never the ambient
-    # PATH above, see %post), proving the conda-forge install itself is
-    # sound independent of anything a subgroup later builds against it.
-    # apptainer runs %test under /bin/sh (dash) -- `source` is a bash
-    # builtin, so this needs a real bash, not `.` swapped in for dash.
-    bash <<'G4ROOT_TEST_EOF'
-set -eu
-source /opt/setup-g4root.sh
-root-config --version
-geant4-config --version
-python3 -c "import ROOT; print('PyROOT', ROOT.gROOT.GetVersion())"
-G4ROOT_TEST_EOF
+print('jax', jax.__version__, 'devices', jax.devices()); \
+print('PyROOT', ROOT.gROOT.GetVersion()); \
+ROOT.gInterpreter.Declare('#include <cassert>\\nint t1_probe(){assert(1); return 7;}'); \
+assert ROOT.t1_probe() == 7"
+    root-config --version
+    geant4-config --version
+    [ -n "$G4NEUTRONHPDATA" ] && [ -d "$G4NEUTRONHPDATA" ]
+    # Compiler settings must stay out of the default environment.
+    [ -z "${CXXFLAGS:-}" ]
+    # No libstdc++ ABI-mismatch warning from cling (GXX_VERSION pin).
+    out="$(bash -c 'source /opt/setup-g4root.sh && root -b -q -l -e "int t1_probe = 0;" 2>&1')"
+    echo "$out"
+    ! echo "$out" | grep -q "standard library mismatch"
