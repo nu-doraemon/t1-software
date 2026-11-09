@@ -1,0 +1,158 @@
+# t1-lartpc -- LArTPC subgroup overlay on top of t1-base. Adds JAXTPC
+# (detector simulation), pimm-data (HDF5 dataset loader), goop
+# (differentiable PMT/light-readout simulation; its chroma sampler brings
+# chroma-lar + TriChroma + photonlib and a Triton override), DLPGenerator
+# + edep-sim (event generation -> Geant4 energy-deposition simulation),
+# pysupera (label matching over the simulated hits) and dprod (the
+# production controller chaining edep-sim -> JAXTPC -> pysupera), each
+# pinned independently of each other and of the shared base. All Python
+# packages install into the base image's single /opt/conda python3
+# (Torch/JAX/PyROOT share it).
+#
+# One RUN per pinned package, each preceded by its own ARG, so bumping
+# one pin rebuilds only that step and the steps after it. Packages are
+# ordered so the ones that change least sit first.
+#
+# Build context is the repository root:
+#   podman build --build-arg-file <versions.env without comments> \
+#       --build-arg BASE_IMAGE=localhost/t1-base-cuda12:<tag> \
+#       -f subgroups/lartpc/Containerfile -t t1-lartpc-cuda12:<tag> .
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends git \
+ && rm -rf /var/lib/apt/lists/*
+
+# Compiled/native deps from conda-forge into the shared prefix, so they
+# link the same libstdc++/HDF5 as ROOT/GEANT4 (h5py, numpy already come
+# from base). yaml-cpp/cmake/make: edep-sim's build toolchain, matching
+# conda's compiler (no apt build-essential mixing Ubuntu headers into
+# conda's sysroot). --freeze-installed keeps the base pins (numpy,
+# python, root_base) untouched. cmake<4: edep-sim's
+# cmake_minimum_required predates 3.5, which CMake 4 refuses.
+# pytest-benchmark is required just to parse goop's own pytest.ini
+# (`addopts = --benchmark-skip`). trimesh/rich/fire: the runtime deps of
+# chroma-lar (below) that base does not already ship.
+RUN micromamba install -y -p /opt/conda -c conda-forge --override-channels \
+        --freeze-installed matplotlib tqdm pytest pytest-benchmark \
+        pywavelets yaml-cpp "cmake<4" make \
+        scipy pyyaml hydra-core omegaconf hdf5plugin psutil \
+        "dash>=2.14" "plotly>=5.18" \
+        trimesh rich fire \
+ && micromamba clean -y -a
+
+WORKDIR /opt
+
+# drinkingkazu's fork, not DeepLearnPhysics/JAXTPC: it is upstream plus
+# one commit that writes pixel-hit group_sizes as uint16. Upstream's
+# uint8 wraps for groups over 255 entries, and pysupera rejects such
+# files, so the pixel readout -> label matching chain fails without it.
+# JAXTPC's own requirements.txt is bounded (jax>=0.4,<0.7) so it never
+# clobbers the base image's JAX pin; Torch is not in that file at all.
+ARG JAXTPC_COMMIT
+RUN git clone --quiet https://github.com/drinkingkazu/JAXTPC.git \
+ && git -C JAXTPC checkout --quiet "${JAXTPC_COMMIT}" \
+ && python3 -m pip install --no-cache-dir -r JAXTPC/requirements.txt
+
+# pimm-data excludes torch from its dependency list, so this install
+# never reinstalls a different Torch build. Editable (`-e`): a regular
+# `pip install .` omits src/pimm_data/data/*.json (no package-data
+# declared upstream), breaking its plane-geometry lookups. `[test]` pulls
+# its pytest extra so its suite is runnable in-image.
+# Fetched by SHA, not cloned: upstream rewrote its history, so the pinned
+# commit is on no branch any more and `git clone` no longer receives it.
+# GitHub still serves it by SHA, but may garbage-collect it at any time.
+ARG PIMM_DATA_COMMIT
+RUN git init --quiet pimm-data \
+ && git -C pimm-data remote add origin https://github.com/omaralterkait/pimm-data.git \
+ && git -C pimm-data fetch --quiet origin "${PIMM_DATA_COMMIT}" \
+ && git -C pimm-data checkout --quiet FETCH_HEAD \
+ && python3 -m pip install --no-cache-dir -e "/opt/pimm-data[test]"
+
+# goop has no setup.py/pyproject -- upstream runs it from source via
+# PYTHONPATH, so the checkout is left on disk (on PYTHONPATH through the
+# ENV below). goop vendors its own JAXTPC copy as a git
+# submodule (goop/jaxtpc); the plain, non-recursive clone leaves it
+# uninitialized on purpose, so goop's `tools.*` imports resolve against
+# this image's single pinned /opt/JAXTPC checkout instead of a second,
+# potentially skewed JAXTPC commit. goop's multi-GB photon-library asset
+# (default /sdf/data/neutrino/youngsam/compressed_plib_b04_quantile_log_n50.h5)
+# is a host-side file read at runtime, never baked into the image.
+ARG GOOP_COMMIT
+RUN git clone --quiet https://github.com/CIDeR-ML/goop.git \
+ && git -C goop checkout --quiet "${GOOP_COMMIT}"
+
+# goop's chroma sampler: chroma-lar (detector geometries), TriChroma
+# (Chroma on Triton; imports as `chroma`) and photonlib. --no-deps:
+# chroma-lar pins torch==2.5.1 and TriChroma torch<2.6, and pip would
+# otherwise replace the base image's Torch. Their other deps (numpy,
+# scipy, h5py, PyYAML, pydantic, tqdm, matplotlib, trimesh, rich, fire)
+# are already installed above or by base.
+# TriChroma's kernels fail to compile under the Triton 3.7.1 that the
+# base Torch wheel ships (MLIR TritonGPURemoveLayoutConversions error),
+# and pass under the Triton 3.1 series TriChroma is validated on. Nothing
+# else in this image imports triton directly. torch.compile on the base
+# Torch still runs a GPU kernel with this Triton (checked by
+# tests/image-test.sh).
+ARG TRICHROMA_COMMIT
+ARG PHOTONLIB_COMMIT
+ARG CHROMA_LAR_COMMIT
+ARG TRICHROMA_TRITON_VERSION
+RUN python3 -m pip install --no-cache-dir --no-deps \
+        "trichroma @ git+https://github.com/youngsm/trichroma.git@${TRICHROMA_COMMIT}" \
+        "photonlib @ git+https://github.com/CIDeR-ML/photonlib.git@${PHOTONLIB_COMMIT}" \
+        "chroma-lar @ git+https://github.com/youngsm/chroma-lar.git@${CHROMA_LAR_COMMIT}" \
+ && python3 -m pip install --no-cache-dir --no-deps "triton==${TRICHROMA_TRITON_VERSION}"
+
+# Editable, like pimm-data: the campaign configs and dprod's provenance
+# read pysupera/conf/*.yaml straight from this checkout. Its dependencies
+# (numpy, scipy, h5py, hdf5plugin, hydra-core, omegaconf) and the `app`
+# extra's (dash, plotly, for pysupera-app) already came from conda-forge
+# above, so pip resolves nothing new. The gpu/numba/wandb extras stay
+# out: no GPU library beyond the base's Torch/JAX is needed for CPU label
+# matching, and torch/psutil are already present.
+ARG PYSUPERA_COMMIT
+RUN git clone --quiet https://github.com/drinkingkazu/pysupera.git \
+ && git -C pysupera checkout --quiet "${PYSUPERA_COMMIT}" \
+ && python3 -m pip install --no-cache-dir -e "/opt/pysupera[app]"
+
+# dprod ships no setup.py/pyproject: `bin/dprod*` put the checkout itself
+# on PYTHONPATH and run `python3 -m doraemon_prod`, so the clone is used
+# in place (bin/ goes on PATH through the ENV below). Needs only
+# PyYAML + h5py (conda, above) and git for provenance.
+ARG DPROD_COMMIT
+RUN git clone --quiet https://github.com/drinkingkazu/dprod.git \
+ && git -C dprod checkout --quiet "${DPROD_COMMIT}"
+
+# DLPGenerator then edep-sim, in one step: edep-sim links DLPGenerator's
+# build, so a DLPGenerator bump must rebuild edep-sim too (see
+# build/build-generators.sh).
+ARG DLPGENERATOR_COMMIT
+ARG EDEPSIM_COMMIT
+COPY subgroups/lartpc/build/build-generators.sh /tmp/build-generators.sh
+RUN bash /tmp/build-generators.sh && rm /tmp/build-generators.sh
+
+# Runtime environment, static like the base's: DLPGenerator's runtime env
+# (mirrors its own setup.sh), edep-sim, dprod's bin/, and the source-tree
+# packages (JAXTPC, goop, DLPGenerator's python/) on PYTHONPATH, so
+# dlpgen, PyROOT's ParticleBomb, edep-sim and dprod work with no setup
+# step. Base sets no PYTHONPATH or ROOT_INCLUDE_PATH, so these are the
+# whole value.
+ENV DLPGENERATOR_DIR=/opt/DLPGenerator \
+    DLPGENERATOR_BINDIR=/opt/DLPGenerator/bin \
+    DLPGENERATOR_BUILDDIR=/opt/DLPGenerator/build \
+    DLPGENERATOR_LIBDIR=/opt/DLPGenerator/build/lib \
+    DLPGENERATOR_INCDIR=/opt/DLPGenerator/build/include \
+    EDEPSIM_ROOT=/opt/edep-sim-install
+ENV LD_LIBRARY_PATH=${DLPGENERATOR_LIBDIR}:${LD_LIBRARY_PATH} \
+    ROOT_INCLUDE_PATH=${DLPGENERATOR_INCDIR}/DLPGenerator/ParticleBomb \
+    PATH=${EDEPSIM_ROOT}/bin:${DLPGENERATOR_BINDIR}:/opt/dprod/bin:${PATH} \
+    PYTHONPATH=/opt/JAXTPC:/opt/goop:${DLPGENERATOR_DIR}/python
+
+COPY subgroups/lartpc/tests/ /opt/t1-lartpc-tests/
+
+# The conda installs above may have added activate.d hooks.
+RUN /opt/t1-runtime/check-env.sh
+
+WORKDIR /

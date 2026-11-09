@@ -1,0 +1,150 @@
+# t1-base -- shared Torch x JAX + ROOT x GEANT4 layer (one conda python)
+# for all T1 subgroups. No subgroup-specific package (JAXTPC, pimm-data,
+# LUCiD, ...) belongs in this image -- subgroups add those in
+# subgroups/<name>/Containerfile, layered on top via FROM ${BASE_IMAGE}.
+#
+# Steps are split so the layer cache reuses everything above the first
+# changed pin: apt -> micromamba -> conda env -> libstdc++ -> Torch ->
+# JAX -> runtime scripts. Each ARG is declared right before its first
+# use, because a changed ARG value invalidates only the steps after it.
+#
+# Build context is base/:
+#   podman build --build-arg-file <versions.env without comments> \
+#       -f base/Containerfile -t t1-base-cuda12:<tag> base
+FROM docker.io/nvidia/cuda:12.9.1-cudnn-devel-ubuntu22.04
+
+# Rootless podman without a subuid range maps one UID only, so apt's
+# privilege drop to the `_apt` user fails. Run apt's sandbox as root.
+RUN echo 'APT::Sandbox::User "root";' > /etc/apt/apt.conf.d/00-t1-sandbox \
+ && apt-get update \
+ && apt-get install -y --no-install-recommends curl ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+
+# ONE Python for the whole image: conda-forge's CPython 3.11 at
+# /opt/conda, shared by PyROOT (root_base's own py311 build) and the
+# pip-installed Torch x JAX stack below. Two interpreters (Ubuntu's apt
+# python3.11 for Torch/JAX + a separate conda python for PyROOT) meant
+# bare `python3` could only ever serve one of them -- e.g.
+# DLPGenerator's `#!/usr/bin/env python3` dlpgen needs `import ROOT`
+# while every Torch/JAX consumer needs the other interpreter -- so the
+# two stacks live in one prefix. ROOT/GEANT4 come from conda-forge
+# (prebuilt; building either from source would take hours), Torch/JAX
+# from their own CUDA-tagged pip wheels. micromamba is kept in the image
+# (single static binary) so subgroup overlays can add their own
+# conda-forge packages into this prefix.
+ARG MICROMAMBA_VERSION
+ARG MICROMAMBA_SHA256
+RUN curl -fsSL -o /usr/local/bin/micromamba \
+        "https://github.com/mamba-org/micromamba-releases/releases/download/${MICROMAMBA_VERSION}/micromamba-linux-64" \
+ && echo "${MICROMAMBA_SHA256}  /usr/local/bin/micromamba" | sha256sum -c - \
+ && chmod +x /usr/local/bin/micromamba
+
+# gxx_linux-64 pinned to the GCC series root_base was built with: cling
+# compares the libstdc++ headers it parses at runtime against the
+# __GLIBCXX__ it was compiled with, and an unpinned solve pulls a newer
+# gcc point release, giving a (harmless but alarming) "Possible C++
+# standard library mismatch" warning on every rootcling / PyROOT start.
+# `numpy>=2`: JAXTPC uses numpy-2-only API (np.trapezoid); conda owns
+# numpy so pip never swaps it under root_base's compiled bindings.
+# `expat`/`hdf5`/`h5py`: geant4 only pulls the libexpat runtime, not the
+# headers/CMake config edep-sim's find_package(EXPAT) needs; hdf5 is
+# edep-sim's H5DLP C++ output layer, and h5py must link that same
+# libhdf5 so Python readers and the C++ writer share one HDF5 build.
+ARG PYTHON_VERSION
+ARG ROOT_VERSION
+ARG GEANT4_VERSION
+ARG GEANT4_BUILD_VARIANT
+ARG GXX_VERSION
+ENV MAMBA_ROOT_PREFIX=/opt/micromamba
+RUN micromamba create -y -p /opt/conda -c conda-forge --override-channels \
+        "python=${PYTHON_VERSION}" \
+        "root_base=${ROOT_VERSION}" \
+        "geant4=${GEANT4_VERSION}=${GEANT4_BUILD_VARIANT}" \
+        "gxx_linux-64=${GXX_VERSION}" \
+        "numpy>=2" scipy expat hdf5 h5py pyyaml pip \
+ && micromamba clean -y -a
+
+# One libstdc++ per process: torch's wheel resolves libstdc++.so.6
+# through the system search path (Ubuntu's GCC 11 copy), and once that is
+# loaded ROOT's libCling/libcppyy_backend (GCC 14, need GLIBCXX_3.4.31)
+# fail with "could not load cppyy_backend library" whenever torch is
+# imported before ROOT. Register conda's newer libstdc++/libgcc_s ahead
+# of the system dir image-wide -- libstdc++ is backward compatible, so
+# every Ubuntu binary keeps working -- via a directory holding only those
+# two libraries (NOT all of /opt/conda/lib, whose OpenSSL/zlib/etc. must
+# never shadow Ubuntu's).
+RUN mkdir -p /opt/conda/lib-runtime \
+ && ln -sf /opt/conda/lib/libstdc++.so.6 /opt/conda/lib-runtime/libstdc++.so.6 \
+ && ln -sf /opt/conda/lib/libgcc_s.so.1 /opt/conda/lib-runtime/libgcc_s.so.1 \
+ && echo /opt/conda/lib-runtime > /etc/ld.so.conf.d/000-conda-libstdcxx.conf \
+ && ldconfig \
+ && ldconfig -p | grep -m1 'libstdc++.so.6 ' | grep -q /opt/conda/lib-runtime
+
+# Torch pinned FIRST via its own CUDA-tagged index -- installing JAX (or
+# anything else) before this must never be allowed to pull a different
+# Torch build; later installs resolve against it.
+ARG TORCH_VERSION
+ARG TORCH_INDEX_URL
+RUN /opt/conda/bin/python3 -m pip install --no-cache-dir \
+        "torch==${TORCH_VERSION}" --index-url "${TORCH_INDEX_URL}"
+
+# JAX CUDA 12 wheel bundle (nvidia-* runtime libs from PyPI).
+ARG JAX_VERSION
+RUN /opt/conda/bin/python3 -m pip install --no-cache-dir "jax[cuda12]==${JAX_VERSION}"
+
+# Runtime environment: static ENV only, no entrypoint and no sourced
+# script, so every launch path sees the same environment -- docker/podman
+# run and exec, an overridden --entrypoint, Kubernetes `command:`, and
+# apptainer (which imports OCI ENV into exec/run/shell).
+#
+# The values mirror what conda's activate.d hooks set. The geant4-data
+# hooks point at versioned dirs (e.g. NDL4.6) that move with the geant4
+# pin, so link-g4data.sh gives each a version-free /opt/g4data/<VAR>
+# symlink for ENV to name. check-env.sh (last step here and in every
+# overlay) fails the build if ENV stops covering any hook's variable.
+# The compiler hooks stay out: they export CC/CXX/CFLAGS/LDFLAGS for
+# conda's cross toolchain, which would silently hijack every unrelated
+# build (`pip install` of an sdist, a user's own make); they are opt-in
+# via /opt/setup-g4root.sh.
+#
+# CONDA_BUILD_SYSROOT: cling (PyROOT, rootcling) locates glibc headers
+# through it; without it `import ROOT` fails with "'assert.h' file not
+# found". It is a path, not a compiler flag. No PYTHONPATH: putting /opt
+# on it turns every checkout under /opt into an importable namespace
+# package that shadows the real one (`import pysupera` resolved to
+# /opt/pysupera without running its __init__). Overlays add the specific
+# checkout dirs they need.
+COPY runtime/hook-env.sh runtime/link-g4data.sh runtime/check-env.sh /opt/t1-runtime/
+COPY runtime/setup-g4root.sh /opt/setup-g4root.sh
+RUN chmod +x /opt/t1-runtime/*.sh /opt/setup-g4root.sh \
+ && /opt/t1-runtime/link-g4data.sh
+
+ENV CONDA_PREFIX=/opt/conda \
+    CONDA_BUILD_SYSROOT=/opt/conda/x86_64-conda-linux-gnu/sysroot \
+    PATH=/opt/conda/bin:/usr/local/nvidia/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+    PYTHONDONTWRITEBYTECODE=1 \
+    ROOTSYS=/opt/conda \
+    PYTHIA8=/opt/conda \
+    PYTHIA8_DIR=/opt/conda \
+    PYTHIA8DATA=/opt/conda/share/Pythia8/xmldoc \
+    GSETTINGS_SCHEMA_DIR=/opt/conda/share/glib-2.0/schemas \
+    XML_CATALOG_FILES="file:///opt/conda/etc/xml/catalog file:///etc/xml/catalog" \
+    G4ABLADATA=/opt/g4data/G4ABLADATA \
+    G4ENSDFSTATEDATA=/opt/g4data/G4ENSDFSTATEDATA \
+    G4INCLDATA=/opt/g4data/G4INCLDATA \
+    G4LEDATA=/opt/g4data/G4LEDATA \
+    G4LEVELGAMMADATA=/opt/g4data/G4LEVELGAMMADATA \
+    G4NEUTRONHPDATA=/opt/g4data/G4NEUTRONHPDATA \
+    G4PARTICLEXSDATA=/opt/g4data/G4PARTICLEXSDATA \
+    G4PIIDATA=/opt/g4data/G4PIIDATA \
+    G4RADIOACTIVEDATA=/opt/g4data/G4RADIOACTIVEDATA \
+    G4REALSURFACEDATA=/opt/g4data/G4REALSURFACEDATA \
+    G4SAIDXSDATA=/opt/g4data/G4SAIDXSDATA
+
+COPY tests/ /opt/t1-base-tests/
+RUN /opt/t1-runtime/check-env.sh
+
+# Clear nvidia/cuda's inherited entrypoint (a license banner + exec), so
+# `podman run <image> <cmd>` runs <cmd> directly.
+ENTRYPOINT []
+CMD ["/bin/bash"]

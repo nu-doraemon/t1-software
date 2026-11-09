@@ -27,11 +27,14 @@ not tracked here.
   deliberately left uninitialized so its `tools.*` imports resolve against
   this image's single pinned `/opt/JAXTPC` checkout instead of a second,
   potentially skewed commit, and its multi-GB photon-library asset stays a
-  host-side path read at runtime, never baked into the image. Not yet
+  host-side path read at runtime, never baked into the image. Its chroma
+  sampler needs chroma-lar + TriChroma + photonlib, installed `--no-deps`
+  to keep the base Torch, plus a Triton 3.1 override because TriChroma's
+  kernels do not compile under the base Torch's Triton 3.7.1. Not yet
   wired into the full labeled-chain integration test below -- so far only
-  its own unit suite runs in-image.
+  its own unit suite runs in-image (chroma tests need `apptainer exec --nv`).
 - **Tests** -- JAXTPC's, pimm-data's, and goop's own unit-test suites re-run
-  in-image as part of `%test` (all three self-skip GPU/asset-only cases),
+  in-image from `tests/image-test.sh` (all three self-skip GPU/asset-only cases),
   plus a DLPGenerator -> edep-sim bomb-macro -> H5DLP seam test
   (`tests/test_generator_edepsim.sh`); still pending: extend the
   integration test to the full generation-to-labeled chain (edep-sim ->

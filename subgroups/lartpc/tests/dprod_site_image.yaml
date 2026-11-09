@@ -1,0 +1,42 @@
+# dprod site config for running the whole production chain (edep-sim ->
+# JAXTPC -> pysupera) inside the t1-lartpc image, with dprod's own local
+# scheduler: no slurm, and no nested container (the controller and every
+# stage run in the one container the caller started, so `container.exec`
+# is empty). Every software location below is the in-image checkout.
+#
+# Used by test_dprod_pipeline.sh through `dprod-install-test --site`, which
+# overrides storage_root/log_root with directories under its own output
+# directory (the values here only have to be present) and takes work_root
+# from --work-root.
+name: t1-lartpc-image
+scheduler: local
+max_array_size: 4
+
+storage_root: /unused
+log_root: /unused
+work_root: /unused
+
+container:
+  exec: ""
+  exec_login: ""
+
+images: {}
+
+# Source checkouts, recorded in every output file's provenance.
+vars:
+  edepsim_exe: edep-sim
+  edepsim_dir: /opt/edep-sim
+  dlpgen_dir: /opt/DLPGenerator
+  jaxtpc_dir: /opt/JAXTPC
+  pysupera_dir: /opt/pysupera
+
+# The image's own environment already carries edep-sim, dlpgen and the
+# library paths, so no per-stage env is needed.
+env: {}
+
+slurm:
+  default: {}
+  profiles:
+    cpu: {}
+    cron: {}
+    gpu: {}
