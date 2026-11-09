@@ -74,10 +74,32 @@ passes even there.)
 ### Layer cache
 
 Each pinned package is its own build step, placed after its own `ARG`.
-A rebuild reuses every step above the first changed pin. The cache lives
-in the podman storage on `$LSCRATCH`, so only the next build on the same
-node reuses it. `podman load` of an archive gives a usable base image on
-another node, but no step cache.
+A rebuild reuses every step above the first changed pin. By default the
+cache lives in the podman storage on `$LSCRATCH`, so only the next build
+on the same node reuses it.
+
+To share the cache across nodes, point `$T1_SOFTWARE_CACHE_DIR` at a
+persistent directory on shared storage:
+
+```bash
+T1_SOFTWARE_CACHE_DIR=/path/to/shared/t1-software-cache scripts/nightly-build.sh
+```
+
+During the two builds, the script runs a registry container
+(`registry:2.8.3`, loopback only, random port) whose blob store is
+`$T1_SOFTWARE_CACHE_DIR/registry`, and builds with `--cache-from` /
+`--cache-to` against it. No external registry or account is involved.
+
+- **Size:** one full set of layers is about 14 GB (6.4 GB of it is the
+  `nvidia/cuda` base). Each rebuild adds the layers it changed: about
+  0.1-0.5 GB for a subgroup pin, about 5 GB for Torch/JAX, 7-8 GB for
+  ROOT/Geant4/Python. Nothing is pruned; plan for about 50 GB and delete
+  the directory when it exceeds that. The next build repopulates it.
+- **Concurrency:** one build at a time. A second build fails fast on
+  `$T1_SOFTWARE_CACHE_DIR/.lock`. The lock is released once the builds
+  finish, before the tests start.
+- **Not cached:** the `FROM nvidia/cuda` base is pulled from Docker Hub
+  on a node that does not have it yet.
 
 ### Tests run by the build
 

@@ -23,6 +23,16 @@
 # one local write plus one move. The layer cache in that storage is
 # reused by the next build on the same node only.
 #
+# Shared layer cache (optional): set $T1_SOFTWARE_CACHE_DIR to a
+# persistent directory on shared storage. For the two builds, the script
+# starts a registry container (REGISTRY_IMAGE, below) on 127.0.0.1 with
+# its blob store in $T1_SOFTWARE_CACHE_DIR/registry, and builds with
+# --cache-from/--cache-to against it. A build on any node then reuses
+# every step whose inputs are unchanged. One build at a time may use the
+# cache: a second one fails fast on $T1_SOFTWARE_CACHE_DIR/.lock. The
+# cache is disposable -- delete the directory to reclaim space; the next
+# build repopulates it. Unset, the script uses the node-local cache only.
+#
 # Tests: the image-test.sh scripts run under podman (CPU) and under
 # apptainer (--nv when a GPU is present); both see the image's static
 # ENV with no setup step. Then dprod-pipeline-test.sh runs
@@ -34,6 +44,11 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# Absolute before the cd below: a relative path is meant from the
+# caller's cwd, and podman's -v reads a relative source as a volume name.
+if [[ -n "${T1_SOFTWARE_CACHE_DIR:-}" ]]; then
+    T1_SOFTWARE_CACHE_DIR="$(realpath -m "$T1_SOFTWARE_CACHE_DIR")"
+fi
 cd "$REPO_ROOT"
 
 VARIANT="${1:-cuda12}"
@@ -121,14 +136,57 @@ LARTPC_ARGFILE="$TMPDIR/lartpc.args"
 argfile base/versions.env > "$BASE_ARGFILE"
 argfile subgroups/lartpc/versions.env > "$LARTPC_ARGFILE"
 
+# Pinned: a registry upgrade must never change the on-disk cache format
+# silently.
+REGISTRY_IMAGE=docker.io/library/registry:2.8.3
+CACHE_ARGS=()
+REGISTRY_NAME=""
+stop_registry() {
+    [[ -n "$REGISTRY_NAME" ]] && pm rm -f -t 0 "$REGISTRY_NAME" > /dev/null 2>&1 || true
+    REGISTRY_NAME=""
+}
+trap stop_registry EXIT
+if [[ -n "${T1_SOFTWARE_CACHE_DIR:-}" ]]; then
+    mkdir -p "$T1_SOFTWARE_CACHE_DIR/registry"
+    exec 9> "$T1_SOFTWARE_CACHE_DIR/.lock"
+    if ! flock -n 9; then
+        echo "nightly-build: another build holds $T1_SOFTWARE_CACHE_DIR/.lock; retry later or unset T1_SOFTWARE_CACHE_DIR" >&2
+        exit 1
+    fi
+    REGISTRY_NAME="t1-cache-registry-$$"
+    # Random free host port, loopback only: nothing off-node can reach it.
+    pm run -d --name "$REGISTRY_NAME" -p 127.0.0.1::5000 \
+        -v "$T1_SOFTWARE_CACHE_DIR/registry:/var/lib/registry" \
+        "$REGISTRY_IMAGE" > /dev/null
+    REGISTRY="127.0.0.1:$(pm port "$REGISTRY_NAME" 5000/tcp | cut -d: -f2)"
+    for _ in $(seq 30); do
+        curl -fs "http://$REGISTRY/v2/" > /dev/null && break
+        sleep 1
+    done
+    curl -fs "http://$REGISTRY/v2/" > /dev/null || { echo "nightly-build: cache registry did not start" >&2; exit 1; }
+    echo "== shared layer cache: $T1_SOFTWARE_CACHE_DIR (registry $REGISTRY) =="
+    # Plain HTTP is acceptable: the registry listens on loopback only.
+    CACHE_ARGS=(--tls-verify=false)
+fi
+cache_args() {  # cache_args <repo>
+    [[ -n "$REGISTRY_NAME" ]] || return 0
+    printf '%s\n' "${CACHE_ARGS[@]}" --cache-from "$REGISTRY/$1" --cache-to "$REGISTRY/$1"
+}
+mapfile -t BASE_CACHE < <(cache_args t1-base-cache)
+mapfile -t LARTPC_CACHE < <(cache_args t1-lartpc-cache)
+
 echo "== podman build ${BASE_REF} =="
-pm build --build-arg-file "$BASE_ARGFILE" \
+pm build "${BASE_CACHE[@]}" --build-arg-file "$BASE_ARGFILE" \
     -f base/Containerfile -t "$BASE_REF" base
 
 echo "== podman build ${LARTPC_REF} =="
-pm build --build-arg-file "$LARTPC_ARGFILE" \
+pm build "${LARTPC_CACHE[@]}" --build-arg-file "$LARTPC_ARGFILE" \
     --build-arg "BASE_IMAGE=${BASE_REF}" \
     -f subgroups/lartpc/Containerfile -t "$LARTPC_REF" .
+
+# The cache is needed only by the builds; release it for other builds now.
+stop_registry
+exec 9>&-
 
 echo "== image tests under podman (CPU) =="
 pm run --rm "$BASE_REF" bash /opt/t1-base-tests/image-test.sh
