@@ -605,8 +605,14 @@ def run(state, key):
     stage = None
     lock_busy = False
     try:
-        proc = subprocess.Popen(cmd, cwd=src, env=env, stdout=subprocess.PIPE,
-                                stderr=subprocess.STDOUT, text=True)
+        try:
+            proc = subprocess.Popen(cmd, cwd=src, env=env, stdout=subprocess.PIPE,
+                                    stderr=subprocess.STDOUT, text=True)
+        except OSError as e:
+            print(f"nightly: cannot start build.sh: {e}", file=sys.stderr, flush=True)
+            finish(state, key, "failed", "start build.sh")
+            shutil.rmtree(src, ignore_errors=True)
+            return 1
         for line in proc.stdout:
             sys.stdout.write(line)
             sys.stdout.flush()
