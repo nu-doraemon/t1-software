@@ -407,6 +407,19 @@ def _poll(state, site, dry_run):
     reconcile(state, site, records, dry_run)
     active = [r for r in records if r["status"] in ACTIVE]
 
+    try:
+        heads = resolve_heads(state, site)
+    except PollError as e:
+        if not dry_run:
+            write_json(state / "last-poll.json",
+                       {"time": now_iso(), "ok": False, "error": str(e), "heads": prev_heads})
+        log(state, f"error: {e}", dry_run=dry_run)
+        return 1
+    if dry_run:
+        for name, sha in heads.items():
+            print(f"{name} {sha}")
+    # Resolve HEADs before any submission: a failed lookup submits nothing,
+    # not even the automatic retry of an interrupted build.
     if not active:
         pending = [r for r in records if r["status"] == "interrupted" and r["attempts"] == 1]
         if pending:
@@ -421,18 +434,6 @@ def _poll(state, site, dry_run):
                     return 1
                 log(state, f"auto-retry {rec['key']} job {job_id}")
             active = [rec]
-
-    try:
-        heads = resolve_heads(state, site)
-    except PollError as e:
-        if not dry_run:
-            write_json(state / "last-poll.json",
-                       {"time": now_iso(), "ok": False, "error": str(e), "heads": prev_heads})
-        log(state, f"error: {e}", dry_run=dry_run)
-        return 1
-    if dry_run:
-        for name, sha in heads.items():
-            print(f"{name} {sha}")
 
     ok = {"time": now_iso(), "ok": True, "error": None, "heads": heads}
     if active:

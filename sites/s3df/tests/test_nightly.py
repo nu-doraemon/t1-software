@@ -361,6 +361,18 @@ class NightlyTest(unittest.TestCase):
         self.assertEqual(f.calls(), [])
         self.assertEqual(f.records(), [])
 
+    def test_lookup_failure_blocks_auto_retry(self):
+        f = self.fixture()
+        f.poll()
+        f.set_sacct(101, "PREEMPTED")
+        f.write_pins(f"file://{f.root / 'missing.git'}", f.A)
+        f.commit_t1("broken repo url")
+        self.assertEqual(f.poll(), 1)
+        rec = f.only_record()
+        self.assertEqual(rec["status"], "interrupted")
+        self.assertEqual(rec["attempts"], 1)
+        self.assertEqual(len(f.calls()), 1)
+
     def test_sbatch_failure(self):
         f = self.fixture()
         os.environ["FAKE_SBATCH_RC"] = "1"
