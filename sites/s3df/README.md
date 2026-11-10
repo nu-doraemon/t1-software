@@ -37,7 +37,7 @@ cron (sdfcron001, daily)
 1. Make a state directory and copy `site.env.example` to
    `<state>/site.env`. Set `IMAGES_DIR` and `SLURM_ACCOUNT`; set
    `CACHE_DIR` to a shared layer cache if you have one.
-2. Check the poll without writing anything:
+2. Check the poll. A dry run writes only the bare cache `<state>/t1-software.git/`:
    ```bash
    uv run --script sites/s3df/nightly.py poll --dry-run --state <state>
    ```
