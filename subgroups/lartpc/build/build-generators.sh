@@ -6,10 +6,10 @@
 # "/generator/kinematics/set bomb" seam, so the build order is
 # load-bearing). Both build with conda's own compiler via
 # /opt/setup-g4root.sh -- the same GCC series ROOT/GEANT4 were built
-# with. Pins and clone URLs come from the DLPGENERATOR_{REPO,COMMIT} and
-# EDEPSIM_{REPO,COMMIT} build args. bash, not sh: DLPGenerator's setup.sh is bash-only
-# (`${BASH_SOURCE[0]}`, `[[ ]]`). No `-u`: neither setup.sh nor conda's
-# hooks are nounset-safe.
+# with. Pins and clone URLs come from the DLPGENERATOR_{REPO,COMMIT}
+# and EDEPSIM_{REPO,COMMIT} build args. bash, not sh: DLPGenerator's
+# setup.sh is bash-only (`${BASH_SOURCE[0]}`, `[[ ]]`). No `-u`: neither
+# setup.sh nor conda's hooks are nounset-safe.
 set -e
 source /opt/setup-g4root.sh
 

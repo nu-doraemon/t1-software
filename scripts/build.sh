@@ -110,6 +110,7 @@ while (($#)); do
     opt="$1"
     val=""
     case "$opt" in
+        --help=*|--no-sif=*|--no-pipeline-test=*) die_usage "${opt%%=*} takes no value" ;;
         --*=*) val="${opt#*=}"; opt="${opt%%=*}"; set -- "$opt" "$val" "${@:2}" ;;
     esac
     case "$opt" in
