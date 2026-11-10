@@ -1,0 +1,11 @@
+# Daily poll for the S3DF nightly, for the user crontab on sdfcron001.
+#
+# S3DF disables scrontab, and user crontabs on login and compute nodes,
+# so the line goes on sdfcron001. Add it without dropping your existing
+# entries: `crontab -l > cron.txt`, append the line below to cron.txt,
+# then `crontab cron.txt`.
+# Cron's PATH lacks ~/.local/bin, so uv is called by its absolute path.
+# Replace /path/to/state and /path/to/t1-software.
+#
+# m h dom mon dow  -- daily poll on sdfcron001
+15 6 * * * T1_NIGHTLY_STATE=/path/to/state $HOME/.local/bin/uv run --script /path/to/t1-software/sites/s3df/nightly.py poll >> /path/to/state/cron.log 2>&1
