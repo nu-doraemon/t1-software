@@ -1,0 +1,562 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = []
+# ///
+"""Nightly HEAD builds of t1-software on S3DF.
+
+Two layers do the work. scripts/build.sh is the generic layer: it builds
+one commit set and knows nothing about the nightly. This script is the
+site layer. Once a day, cron runs `poll` on the cron node. `poll` resolves
+the HEAD of t1-software and of every package that has a <PKG>_REPO key in
+versions.env. The commit set gives a build key. A key that is new to the
+ledger gets one Slurm job, which runs `run` on a GPU node. `run` fetches
+t1-software at the recorded commit into a scratch clone and calls
+build.sh with --pin and --tag. No t1-software checkout is ever modified.
+
+Ledger, under the state directory (--state or $T1_NIGHTLY_STATE):
+
+    site.env                      site values (paths, Slurm account, ...)
+    last-poll.json                {time, ok, error, heads}
+    poll.log                      one line per poll decision
+    t1-software.git/              bare cache, used to read versions.env
+    builds/<key>/record.json      one record per commit set
+    builds/<key>/build.log        latest attempt; attempt-N.log for earlier
+    builds/<key>/review.json      written only by `review`
+
+Statuses:
+
+    queued       poll/retry, after sbatch succeeds
+    running      run, at job start
+    success      run, build.sh exit 0
+    failed       run, build.sh exit != 0; or poll, from sacct
+    interrupted  poll, on PREEMPTED, TIMEOUT or NODE_FAIL; poll resubmits
+                 it once, then it waits for `retry`
+    cancelled    poll, on CANCELLED; waits for `retry`
+
+A key that has a record is never built again automatically, whatever its
+status. Only `retry` rebuilds it. At most one build is queued or running.
+"""
+import argparse
+import contextlib
+import fcntl
+import getpass
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+T1 = "T1_SOFTWARE_COMMIT"
+ACTIVE = ("queued", "running")
+RETRYABLE = ("failed", "interrupted", "cancelled")
+SLURM_ALIVE = {"PENDING", "RUNNING", "REQUEUED", "SUSPENDED", "CONFIGURING",
+               "COMPLETING", "RESIZING"}
+SLURM_INTERRUPT = {"PREEMPTED", "TIMEOUT", "NODE_FAIL"}
+GIT_TIMEOUT = 120  # s; one ls-remote or shallow fetch takes a few seconds
+
+# site.env keys. None means: required (REQUIRED) or computed in load_site.
+SITE_DEFAULTS = {
+    "T1_SOFTWARE_REPO": "https://github.com/nu-doraemon/t1-software.git",
+    "T1_SOFTWARE_BRANCH": "main",
+    "VARIANT": "cuda12",
+    "IMAGES_DIR": None,
+    "CACHE_DIR": "",
+    "WORK_DIR": "",
+    "NIGHTLY_KEEP": "7",
+    "POLL_INTERVAL_HOURS": "24",
+    "DASHBOARD_DIR": None,
+    "UV": None,
+    "SLURM_ACCOUNT": None,
+    "SLURM_PARTITION": "ampere",
+    "SLURM_QOS": "normal",
+    "SLURM_GPUS": "1",
+    "SLURM_CPUS": "8",
+    "SLURM_MEM": "32G",
+    "SLURM_TIME": "16:00:00",
+    "SBATCH": "sbatch",
+    "SACCT": "sacct",
+}
+REQUIRED = ("IMAGES_DIR", "SLURM_ACCOUNT")
+
+KV_LINE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=(.*)$")
+
+
+class UsageError(Exception):
+    """Bad configuration or arguments; exit code 2."""
+
+
+class PollError(Exception):
+    """A HEAD lookup failed; the poll submits nothing."""
+
+
+class SubmitError(Exception):
+    """sbatch failed."""
+
+
+class SacctError(Exception):
+    """sacct failed."""
+
+
+def now_iso():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def parse_kv(text, strip_quotes=False):
+    """KEY=VALUE lines of a versions.env or site.env; other lines are ignored."""
+    out = {}
+    for line in text.splitlines():
+        m = KV_LINE.match(line.strip())
+        if not m:
+            continue
+        key, value = m.group(1), m.group(2).strip()
+        if strip_quotes and len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        out[key] = value
+    return out
+
+
+def load_site(state):
+    path = state / "site.env"
+    if not path.exists():
+        raise UsageError(f"site.env: {path} not found")
+    given = parse_kv(path.read_text(), strip_quotes=True)
+    for key in given:
+        if key not in SITE_DEFAULTS:
+            raise UsageError(f"site.env: unknown key {key}")
+    site = {}
+    for key, default in SITE_DEFAULTS.items():
+        value = given.get(key, "")
+        site[key] = value if value != "" else (default or "")
+    for key in REQUIRED:
+        if not site[key]:
+            raise UsageError(f"site.env: {key} is required")
+    if not site["DASHBOARD_DIR"]:
+        site["DASHBOARD_DIR"] = str(state / "site")
+    # uv sets $UV to its own path for the scripts it runs. Cron's PATH
+    # lacks ~/.local/bin, so the Slurm job needs this absolute path.
+    uv = site["UV"] or os.environ.get("UV") or shutil.which("uv")
+    if not uv:
+        raise UsageError("site.env: UV not found")
+    site["UV"] = os.path.abspath(uv)
+    return site
+
+
+def load_json(path):
+    try:
+        return json.loads(Path(path).read_text())
+    except FileNotFoundError:
+        return None
+
+
+def write_json(path, data):
+    """Write to a temp file in the same directory, then rename over."""
+    path = Path(path)
+    tmp = path.with_name(f".{path.name}.tmp.{os.getpid()}")
+    tmp.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
+    os.replace(tmp, path)
+
+
+@contextlib.contextmanager
+def ledger_lock(state):
+    """Exclusive lock on <state>/.lock. fcntl.flock is not reentrant."""
+    state.mkdir(parents=True, exist_ok=True)
+    with open(state / ".lock", "a+") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
+
+
+def build_key(variant, t1_commit, pins):
+    blob = json.dumps({"variant": variant, "t1_software_commit": t1_commit, "pins": pins},
+                      sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(blob.encode()).hexdigest()[:12]
+
+
+def build_dir(state, key):
+    return state / "builds" / key
+
+
+def record_path(state, key):
+    return build_dir(state, key) / "record.json"
+
+
+def load_records(state):
+    """All records, newest queued_at first."""
+    records = []
+    for path in (state / "builds").glob("*/record.json"):
+        rec = load_json(path)
+        if rec is not None:
+            records.append(rec)
+    records.sort(key=lambda r: r.get("queued_at") or "", reverse=True)
+    return records
+
+
+def save_record(state, record):
+    write_json(record_path(state, record["key"]), record)
+
+
+def review_state(record, review):
+    if (record["status"] in RETRYABLE and review is not None
+            and review.get("attempt") == record["attempts"]):
+        return "reviewed"
+    if record["status"] == "failed":
+        return "needs review"
+    return ""
+
+
+def log(state, msg, *, dry_run=False):
+    print(msg, flush=True)
+    if not dry_run:
+        with open(state / "poll.log", "a") as f:
+            f.write(f"{now_iso()} {msg}\n")
+
+
+def git(*args):
+    """Run git; any failure is a PollError. Returns stdout."""
+    env = dict(os.environ, GIT_TERMINAL_PROMPT="0")
+    cmd = ["git", *args]
+    try:
+        r = subprocess.run(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                           text=True, timeout=GIT_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        raise PollError(f"{' '.join(cmd)}: timed out after {GIT_TIMEOUT} s") from None
+    if r.returncode != 0:
+        raise PollError(f"{' '.join(cmd)}: {r.stderr.strip()}")
+    return r.stdout
+
+
+def ls_remote(repo, ref):
+    out = git("ls-remote", repo, ref).split()
+    if not out:
+        raise PollError(f"git ls-remote {repo} {ref}: no such ref")
+    return out[0]
+
+
+def resolve_heads(state, site):
+    """HEADs of t1-software and of every package with a <PKG>_REPO key."""
+    repo, branch = site["T1_SOFTWARE_REPO"], site["T1_SOFTWARE_BRANCH"]
+    commit = ls_remote(repo, f"refs/heads/{branch}")
+    cache = state / "t1-software.git"
+    if not cache.exists():
+        git("init", "--bare", "--quiet", str(cache))
+    git("-C", str(cache), "fetch", "--quiet", "--depth", "1", repo, commit)
+    paths = ["base/versions.env"]
+    for line in git("-C", str(cache), "ls-tree", "--name-only", commit, "subgroups/").splitlines():
+        paths.append(f"{line}/versions.env")
+    heads = {T1: commit}
+    for path in paths:
+        try:
+            text = git("-C", str(cache), "show", f"{commit}:{path}")
+        except PollError:
+            if path == "base/versions.env":
+                raise
+            continue  # a subgroup without its own pins
+        pins = parse_kv(text)
+        for key in sorted(pins):
+            if key.endswith("_COMMIT") and pins.get(key[: -len("_COMMIT")] + "_REPO"):
+                heads[key] = ls_remote(pins[key[: -len("_COMMIT")] + "_REPO"], "HEAD")
+    return heads
+
+
+def sacct_state(site, job_id):
+    """First word of the job's Slurm state; "" when sacct does not know it yet."""
+    cmd = [site["SACCT"], "-n", "-X", "-P", "-j", job_id, "-o", "State"]
+    try:
+        r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                           text=True, timeout=60)
+    except subprocess.TimeoutExpired:
+        raise SacctError("timed out") from None
+    if r.returncode != 0:
+        raise SacctError(r.stderr.strip())
+    lines = r.stdout.strip().splitlines()
+    return lines[0].split()[0] if lines and lines[0].split() else ""
+
+
+def submit(state, site, record):
+    """sbatch one build job; returns its job id."""
+    state = state.resolve()
+    here = Path(__file__).resolve()
+    key = record["key"]
+    cmd = [
+        site["SBATCH"], "--parsable",
+        "--job-name", f"t1-nightly-{key}",
+        "--account", site["SLURM_ACCOUNT"],
+        "--partition", site["SLURM_PARTITION"],
+        "--qos", site["SLURM_QOS"],
+        "--gpus", site["SLURM_GPUS"],
+        "--cpus-per-task", site["SLURM_CPUS"],
+        "--mem", site["SLURM_MEM"],
+        "--time", site["SLURM_TIME"],
+        "--output", str(build_dir(state, key) / "build.log"),
+        "--open-mode", "append",
+        # The poll owns retries; Slurm's own requeue would race it.
+        "--no-requeue",
+        "--export", "ALL",
+        str(here.parent / "build.sbatch"),
+        site["UV"], str(here), "run", key, "--state", str(state),
+    ]
+    try:
+        r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                           text=True, timeout=120)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise SubmitError(str(e)) from None
+    if r.returncode != 0:
+        raise SubmitError(r.stderr.strip() or f"exit {r.returncode}")
+    return r.stdout.strip().split(";", 1)[0].strip()
+
+
+def resubmit(state, site, record):
+    """Submit a new attempt of an existing record. Returns the job id.
+
+    On sbatch failure the record and its logs stay as they were.
+    """
+    d = build_dir(state, record["key"])
+    log_path = d / "build.log"
+    old = d / f"attempt-{record['attempts']}.log"
+    moved = log_path.exists()
+    if moved:
+        os.replace(log_path, old)
+    try:
+        job_id = submit(state, site, record)
+    except SubmitError:
+        if moved:
+            os.replace(old, log_path)
+        raise
+    record.update(attempts=record["attempts"] + 1, status="queued", queued_at=now_iso(),
+                  started_at=None, finished_at=None, failed_stage=None)
+    record["slurm_job_ids"].append(job_id)
+    save_record(state, record)
+    return job_id
+
+
+def new_record(site, key, heads, changed):
+    queued_at = now_iso()
+    return {
+        "key": key,
+        "variant": site["VARIANT"],
+        "t1_software_commit": heads[T1],
+        "pins": {k: v for k, v in heads.items() if k != T1},
+        "changed": changed,
+        "status": "queued",
+        "failed_stage": None,
+        "attempts": 1,
+        "slurm_job_ids": [],
+        "queued_at": queued_at,
+        "started_at": None,
+        "finished_at": None,
+        "tag": f"{queued_at[:4]}{queued_at[5:7]}{queued_at[8:10]}-{key}",
+        "images_dir": str(Path(site["IMAGES_DIR"]) / "nightly"),
+    }
+
+
+def reconcile(state, site, records, dry_run):
+    """Settle queued/running records whose Slurm job ended without a result."""
+    for rec in records:
+        if rec["status"] not in ACTIVE or not rec["slurm_job_ids"]:
+            continue
+        try:
+            st = sacct_state(site, rec["slurm_job_ids"][-1])
+        except SacctError as e:
+            log(state, f"sacct failed for {rec['key']}: {e}", dry_run=dry_run)
+            continue
+        if not st or st in SLURM_ALIVE:
+            continue
+        if st in SLURM_INTERRUPT:
+            new = "interrupted"
+        elif st == "CANCELLED":
+            new = "cancelled"
+        else:
+            new = "failed"
+        if dry_run:
+            log(state, f"would reconcile {rec['key']}: {st} -> {new}", dry_run=True)
+            continue
+        rec["status"] = new
+        if new == "failed" and rec["failed_stage"] is None:
+            rec["failed_stage"] = f"slurm {st}"
+        rec["finished_at"] = now_iso()
+        save_record(state, rec)
+        log(state, f"reconcile {rec['key']}: {st} -> {new}")
+
+
+def _poll(state, site, dry_run):
+    records = load_records(state)
+    prev = load_json(state / "last-poll.json") or {}
+    prev_heads = prev.get("heads") or {}
+
+    reconcile(state, site, records, dry_run)
+    active = [r for r in records if r["status"] in ACTIVE]
+
+    if not active:
+        pending = [r for r in records if r["status"] == "interrupted" and r["attempts"] == 1]
+        if pending:
+            rec = pending[0]
+            if dry_run:
+                log(state, f"would auto-retry {rec['key']}", dry_run=True)
+            else:
+                try:
+                    job_id = resubmit(state, site, rec)
+                except SubmitError as e:
+                    log(state, f"sbatch failed: {e}")
+                    return 1
+                log(state, f"auto-retry {rec['key']} job {job_id}")
+            active = [rec]
+
+    try:
+        heads = resolve_heads(state, site)
+    except PollError as e:
+        if not dry_run:
+            write_json(state / "last-poll.json",
+                       {"time": now_iso(), "ok": False, "error": str(e), "heads": prev_heads})
+        log(state, f"error: {e}", dry_run=dry_run)
+        return 1
+    if dry_run:
+        for name, sha in heads.items():
+            print(f"{name} {sha}")
+
+    ok = {"time": now_iso(), "ok": True, "error": None, "heads": heads}
+    if active:
+        if not dry_run:
+            write_json(state / "last-poll.json", ok)
+        log(state, f"build active: {active[0]['key']}", dry_run=dry_run)
+        return 0
+
+    pins = {k: v for k, v in heads.items() if k != T1}
+    key = build_key(site["VARIANT"], heads[T1], pins)
+    if dry_run:
+        print(f"key {key}")
+    existing = load_json(record_path(state, key))
+    if existing is not None:
+        if heads == prev_heads:
+            log(state, "no change", dry_run=dry_run)
+        else:
+            log(state, f"already built {key} ({existing['status']})", dry_run=dry_run)
+    else:
+        changed = {n: [prev_heads.get(n), sha] for n, sha in heads.items()
+                   if prev_heads.get(n) != sha}
+        if dry_run:
+            log(state, f"would submit {key} changed {','.join(changed)}", dry_run=True)
+            return 0
+        rec = new_record(site, key, heads, changed)
+        d = build_dir(state, key)
+        d.mkdir(parents=True, exist_ok=True)
+        save_record(state, rec)
+        try:
+            job_id = submit(state, site, rec)
+        except SubmitError as e:
+            shutil.rmtree(d, ignore_errors=True)
+            log(state, f"sbatch failed: {e}")
+            return 1
+        rec["slurm_job_ids"].append(job_id)
+        save_record(state, rec)
+        log(state, f"submitted {key} job {job_id} changed {','.join(changed)}")
+
+    if not dry_run:
+        write_json(state / "last-poll.json", ok)
+    return 0
+
+
+def poll(state, dry_run):
+    site = load_site(state)
+    if dry_run:
+        return _poll(state, site, True)
+    with ledger_lock(state):
+        return _poll(state, site, False)
+
+
+def review(state, key, note):
+    with ledger_lock(state):
+        rec = load_json(record_path(state, key))
+        if rec is None:
+            print(f"no record {key}", file=sys.stderr)
+            return 1
+        write_json(build_dir(state, key) / "review.json", {
+            "time": now_iso(), "user": getpass.getuser(), "note": note,
+            "attempt": rec["attempts"],
+        })
+    print(f"reviewed {key}")
+    return 0
+
+
+def retry(state, key):
+    site = load_site(state)
+    with ledger_lock(state):
+        rec = load_json(record_path(state, key))
+        if rec is None:
+            print(f"no record {key}", file=sys.stderr)
+            return 1
+        if rec["status"] not in RETRYABLE:
+            print(f"{key} is {rec['status']}; retry needs failed, interrupted or cancelled",
+                  file=sys.stderr)
+            return 1
+        others = [r for r in load_records(state) if r["status"] in ACTIVE]
+        if others:
+            print(f"build active: {others[0]['key']}", file=sys.stderr)
+            return 1
+        try:
+            job_id = resubmit(state, site, rec)
+        except SubmitError as e:
+            print(f"sbatch failed: {e}", file=sys.stderr)
+            return 1
+    print(f"retry {key} job {job_id} attempt {rec['attempts']}")
+    return 0
+
+
+def status(state):
+    for rec in load_records(state):
+        rv = load_json(build_dir(state, rec["key"]) / "review.json")
+        line = (f"{rec['key']}  {rec['status']:<11}  a{rec['attempts']}  {rec['tag']}  "
+                f"t1={rec['t1_software_commit'][:8]}  changed={len(rec['changed'])}  "
+                f"{review_state(rec, rv)}")
+        print(line.rstrip())
+    return 0
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(prog="nightly.py", description=__doc__.split("\n\n")[0])
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    def add(name, help_):
+        p = sub.add_parser(name, help=help_)
+        p.add_argument("--state", help="state directory (default: $T1_NIGHTLY_STATE)")
+        return p
+
+    p = add("poll", "resolve HEADs; submit a build for a new commit set")
+    p.add_argument("--dry-run", action="store_true",
+                   help="print the decisions; write nothing but the bare cache")
+    p = add("review", "record a review of a build")
+    p.add_argument("key")
+    p.add_argument("--note", required=True)
+    p = add("retry", "submit a new attempt of a failed, interrupted or cancelled build")
+    p.add_argument("key")
+    add("status", "one line per build, newest first")
+
+    args = parser.parse_args(argv)
+    state_arg = args.state or os.environ.get("T1_NIGHTLY_STATE")
+    if not state_arg:
+        print("nightly: --state or $T1_NIGHTLY_STATE is required", file=sys.stderr)
+        return 2
+    state = Path(state_arg).resolve()
+    try:
+        if args.cmd == "poll":
+            return poll(state, args.dry_run)
+        if args.cmd == "review":
+            return review(state, args.key, args.note)
+        if args.cmd == "retry":
+            return retry(state, args.key)
+        if args.cmd == "status":
+            return status(state)
+    except UsageError as e:
+        print(e, file=sys.stderr)
+        return 2
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
