@@ -218,7 +218,7 @@ def nightly_line(link, records):
     build = nightly_build(link, records)
     of = (f" (build <a href=\"builds/{esc(build['key'])}.html\"><code>{esc(build['key'])}</code></a>)"
           if build else "")
-    return (f"Nightly image: <code>{esc(link)}</code> &rarr; <code>{esc(target)}</code>{of}<br>")
+    return f"Nightly image: <code>{esc(link)}</code> &rarr; <code>{esc(target)}</code>{of}"
 
 
 KEY_COMPONENTS = ("PyTorch", "JAX", "ROOT", "Geant4", "Python")
@@ -272,10 +272,15 @@ def render_index(out, site, records, review_states, last_poll, nightly_link, nig
         state = "ok" if last_poll.get("ok") else f"error: {last_poll.get('error')}"
         meta.append(f"Last poll {esc(last_poll['time'])} ({esc(state)}). "
                     f"Rendered {esc(now.strftime('%Y-%m-%dT%H:%M:%SZ'))}.")
-    parts.append(f"<p class=\"meta\">{nightly_line(nightly_link, records)}{'<br>'.join(meta)}</p>")
+    parts.append(f"<p class=\"meta\">{'<br>'.join(meta)}</p>")
+    lines = []
     if nightly_info:
-        parts.append(f"<p class=\"meta\">Base image: {key_versions(nightly_info)} &middot; "
-                     f"<a href=\"builds/{esc(nightly_build(nightly_link, records)['key'])}-image.html\">details</a></p>")
+        lines.append(f"Base image: {key_versions(nightly_info)} &middot; "
+                     f"<a href=\"builds/{esc(nightly_build(nightly_link, records)['key'])}-image.html\">details</a>")
+    if nightly_line(nightly_link, records):
+        lines.append(nightly_line(nightly_link, records))
+    if lines:
+        parts.append(f"<p class=\"meta\">{'<br>'.join(lines)}</p>")
     rows = []
     for rec in records:
         key = rec["key"]
