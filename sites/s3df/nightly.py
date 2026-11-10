@@ -83,6 +83,7 @@ SITE_DEFAULTS = {
     "SLURM_TIME": "16:00:00",
     "SBATCH": "sbatch",
     "SACCT": "sacct",
+    "APPTAINER": "apptainer",
 }
 REQUIRED = ("IMAGES_DIR", "SLURM_ACCOUNT")
 
@@ -309,6 +310,77 @@ def update_nightly_link(site, rec):
     return True
 
 
+def _pip_version(pip, prefix):
+    """Version of the pip package named prefix, else the first one that starts with it."""
+    if prefix in pip:
+        return pip[prefix]
+    return next((v for n, v in sorted(pip.items()) if n.startswith(prefix)), "")
+
+
+def _differs(pinned, installed):
+    return bool(pinned) and not (installed == pinned or installed.startswith(pinned + "."))
+
+
+def compose_image_info(raw, base_pins, size, built_at, sif):
+    """Core-stack rows (pinned vs installed) and the package list of one image.
+
+    raw is the output of image_info.py; base_pins is the base manifest's
+    pins. A pin of "3.11" matches an installed "3.11.17".
+    """
+    pip = dict(raw["pip"])
+    conda = raw["conda"]
+    jax = _pip_version(pip, "jax")
+    spec = [
+        ("OS", "", raw["os"], raw["os"], ""),
+        ("Python", "python_version", raw["python"], raw["python"], "conda-forge"),
+        ("PyTorch", "torch_version", _pip_version(pip, "torch"), _pip_version(pip, "torch"), ""),
+        ("JAX", "jax_version", f"{jax} (jaxlib {_pip_version(pip, 'jaxlib')})", jax, ""),
+        ("CUDA runtime", "", _pip_version(pip, "nvidia-cuda-runtime"), "", "pip"),
+        ("cuDNN", "", _pip_version(pip, "nvidia-cudnn"), "", "pip"),
+        ("Triton", "", _pip_version(pip, "triton"), "", ""),
+        ("NumPy", "", _pip_version(pip, "numpy"), "", ""),
+        ("h5py / HDF5", "", f"{_pip_version(pip, 'h5py')} / {conda.get('hdf5', '')}", "", ""),
+        ("ROOT", "root_version", conda.get("root_base", ""), conda.get("root_base", ""), "root_base, PyROOT"),
+        ("Geant4", "geant4_version", conda.get("geant4", ""), conda.get("geant4", ""), "noqt build"),
+        ("g++ (conda)", "gxx_version", conda.get("gxx_linux-64", ""), conda.get("gxx_linux-64", ""),
+         "the compiler under /opt/conda"),
+        ("CMake", "", raw.get("cmake", ""), "", ""),
+    ]
+    core = []
+    for name, pin_key, shown, compare, note in spec:
+        pinned = base_pins.get(pin_key, "") if pin_key else ""
+        core.append({"name": name, "pinned": pinned, "installed": shown or "-", "note": note,
+                     "differs": _differs(pinned, compare)})
+    return {"core": core, "pip": raw["pip"], "conda_count": len(conda), "size": size,
+            "built_at": built_at, "sif": str(sif)}
+
+
+def write_image_info(state, site, rec):
+    """Inspect the built .sif and write builds/<key>/image-info.json. A failure
+    is reported and never changes the build result. Returns success.
+    """
+    images = Path(rec["images_dir"])
+    sif = images / f"t1-lartpc-{rec['variant']}-{rec['tag']}.sif"
+    if not sif.is_file():
+        return False
+    try:
+        script = Path(__file__).with_name("image_info.py").read_text()
+        r = subprocess.run([site["APPTAINER"], "exec", str(sif), "python", "-"], input=script,
+                           capture_output=True, text=True, timeout=300)
+        if r.returncode != 0:
+            raise RuntimeError(r.stderr.strip()[-300:])
+        raw = json.loads(r.stdout)
+        base = load_json(images / f"t1-base-{rec['variant']}-{rec['tag']}.manifest.json") or {}
+        lartpc = load_json(images / f"t1-lartpc-{rec['variant']}-{rec['tag']}.manifest.json") or {}
+        info = compose_image_info(raw, base.get("pins") or {}, sif.stat().st_size,
+                                  lartpc.get("built_at"), sif)
+        write_json(build_dir(state, rec["key"]) / "image-info.json", info)
+    except (OSError, ValueError, KeyError, RuntimeError, subprocess.SubprocessError) as e:
+        print(f"nightly: image info failed: {e}", file=sys.stderr, flush=True)
+        return False
+    return True
+
+
 def sacct_state(site, job_id):
     """First word of the job's Slurm state; "" when sacct does not know it yet."""
     cmd = [site["SACCT"], "-n", "-X", "-P", "-j", job_id, "-o", "State"]
@@ -525,6 +597,8 @@ def refresh(state, site, out=None):
                 review_states={r["key"]: review_state(r, reviews[r["key"]]) for r in records},
                 last_poll=load_json(state / "last-poll.json"),
                 build_dirs={r["key"]: build_dir(state, r["key"]) for r in records},
+                image_infos={r["key"]: load_json(build_dir(state, r["key"]) / "image-info.json")
+                             for r in records},
                 nightly_link=nightly_link(site, site["VARIANT"]),
                 now=datetime.now(timezone.utc))
     except Exception as e:  # the dashboard must never break a poll or a build
@@ -704,6 +778,7 @@ def _run(state, site, key):
     if rc == 0:
         finish(state, key, "success", None)
         update_nightly_link(site, rec)
+        write_image_info(state, site, rec)
     else:
         finish(state, key, "failed", "cache lock" if lock_busy else stage)
     return rc

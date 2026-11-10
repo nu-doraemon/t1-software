@@ -37,7 +37,7 @@ GIT_ENV = {
 
 # Environment variables the tests set; setUp clears them, tearDown restores them.
 FAKE_VARS = ("T1_NIGHTLY_STATE", "FAKE_SBATCH_RC", "FAKE_BUILD_RC", "FAKE_ARGV", "FAKE_SEEN",
-             "FAKE_EXTRA_LINE", "FAKE_ENV_PROBE", "T1_SKIP_PIPELINE_TEST")
+             "FAKE_EXTRA_LINE", "FAKE_ENV_PROBE", "T1_SKIP_PIPELINE_TEST", "FAKE_APPTAINER_RC")
 
 FAKE_SBATCH = textwrap.dedent("""\
     #!/bin/bash
@@ -68,6 +68,26 @@ FAKE_SACCT = textwrap.dedent("""\
     exit 0
     """)
 
+# What image_info.py prints for the fake image.
+RAW_IMAGE = json.dumps({
+    "os": "Test OS 1", "python": "3.11.17", "cmake": "3.31.8",
+    "pip": [["h5py", "3.16.0"], ["jax", "0.6.2"], ["jaxlib", "0.6.2"], ["numpy", "2.4.6"],
+            ["torch", "2.13.0+cu129"], ["triton", "3.1.0"]],
+    "conda": {"root_base": "6.32.16", "geant4": "10.7.4", "hdf5": "1.14.6",
+              "gxx_linux-64": "14.3.0"}})
+
+# Stands in for `apptainer exec IMAGE python -`: reads the script, prints RAW_IMAGE.
+FAKE_APPTAINER = textwrap.dedent("""\
+    #!/bin/bash
+    root="$(dirname "$(dirname "$0")")"
+    cat > /dev/null
+    if [[ "${FAKE_APPTAINER_RC:-0}" != 0 ]]; then
+        echo "fake apptainer: refused" >&2
+        exit "$FAKE_APPTAINER_RC"
+    fi
+    cat "$root/image_raw.json"
+    """)
+
 # Stands in for scripts/build.sh inside the fetched t1-software commit.
 FAKE_BUILD = textwrap.dedent("""\
     #!/bin/bash
@@ -93,10 +113,12 @@ class Fixture:
         bindir = self.root / "bin"
         bindir.mkdir()
         (self.root / "sacct").mkdir()
-        for name, body in [("sbatch", FAKE_SBATCH), ("sacct", FAKE_SACCT)]:
+        for name, body in [("sbatch", FAKE_SBATCH), ("sacct", FAKE_SACCT),
+                           ("apptainer", FAKE_APPTAINER)]:
             f = bindir / name
             f.write_text(body)
             f.chmod(0o755)
+        (self.root / "image_raw.json").write_text(RAW_IMAGE)
 
         self.pkg_src = self.root / "pkgsrc"
         self.pkg_git = self.root / "pkg.git"
@@ -125,6 +147,7 @@ class Fixture:
             "SLURM_ACCOUNT": "test",
             "SBATCH": str(bindir / "sbatch"),
             "SACCT": str(bindir / "sacct"),
+            "APPTAINER": str(bindir / "apptainer"),
             "WORK_DIR": str(self.root / "work"),
             "UV": "/bin/true",
         }
@@ -480,6 +503,44 @@ class NightlyTest(unittest.TestCase):
         f.main("run", rec["key"])
         self.assertEqual(os.readlink(link), f"nightly/{old.name}")
 
+    def test_compose_image_info(self):
+        raw = json.loads(RAW_IMAGE)
+        info = nightly.compose_image_info(
+            raw, {"python_version": "3.11", "torch_version": "2.13.0+cu129", "jax_version": "0.7.0",
+                  "geant4_version": "10.7", "gxx_version": "14.3", "root_version": "6.30"},
+            1, None, "x.sif")
+        rows = {r["name"]: r for r in info["core"]}
+        self.assertEqual(rows["Python"]["installed"], "3.11.17")
+        self.assertFalse(rows["Python"]["differs"])      # "3.11" matches "3.11.17"
+        self.assertFalse(rows["PyTorch"]["differs"])     # exact, with the local version
+        self.assertEqual(rows["JAX"]["installed"], "0.6.2 (jaxlib 0.6.2)")
+        self.assertTrue(rows["JAX"]["differs"])
+        self.assertFalse(rows["Geant4"]["differs"])      # series pin
+        self.assertFalse(rows["g++ (conda)"]["differs"])
+        self.assertTrue(rows["ROOT"]["differs"])         # "6.30" is not "6.32.16"
+        self.assertEqual(rows["NumPy"]["pinned"], "")
+        self.assertFalse(rows["NumPy"]["differs"])
+        self.assertEqual(info["conda_count"], 4)
+
+    def test_run_writes_image_info(self):
+        f, rec = self.polled()
+        nightly_dir = f.root / "img" / "nightly"
+        nightly_dir.mkdir(parents=True)
+        (nightly_dir / f"t1-lartpc-cuda12-{rec['tag']}.sif").write_text("x")
+        nightly.write_json(nightly_dir / f"t1-base-cuda12-{rec['tag']}.manifest.json",
+                           {"pins": {"jax_version": "0.7.0"}})
+        path = nightly.build_dir(f.state, rec["key"]) / "image-info.json"
+        os.environ["FAKE_APPTAINER_RC"] = "1"  # a failed inspection does not fail the build
+        self.assertEqual(f.main("run", rec["key"])[0], 0)
+        self.assertEqual(f.only_record()["status"], "success")
+        self.assertFalse(path.exists())
+        del os.environ["FAKE_APPTAINER_RC"]
+        f.main("run", rec["key"])
+        info = json.loads(path.read_text())
+        self.assertEqual(info["sif"], str(nightly_dir / f"t1-lartpc-cuda12-{rec['tag']}.sif"))
+        self.assertTrue({r["name"]: r for r in info["core"]}["JAX"]["differs"])
+        self.assertEqual(len(info["pip"]), 6)
+
     def test_run_failure_stage(self):
         f, rec = self.polled()
         os.environ["FAKE_BUILD_RC"] = "1"
@@ -609,6 +670,10 @@ class NightlyTest(unittest.TestCase):
             (d / "build.log").write_text("== stage-one ==\n<b>log</b>\n")
             if name == "ok":
                 (img / f"t1-lartpc-cuda12-{tag}.sif").write_text("x")
+                raw = json.loads((f.root / "image_raw.json").read_text())
+                nightly.write_json(d / "image-info.json", nightly.compose_image_info(
+                    raw, {"jax_version": "0.7.0", "python_version": "3.11"}, 12_586_868_736,
+                    "2026-11-01T00:30:00Z", img / f"t1-lartpc-cuda12-{tag}.sif"))
             if name == "rev":
                 nightly.write_json(d / "review.json", {"time": "t", "user": "u",
                                                        "note": "upstream bug", "attempt": 1})
@@ -644,6 +709,12 @@ class NightlyTest(unittest.TestCase):
         self.assertIn("t1-lartpc-cuda12-nightly.sif", index)
         self.assertIn(f"&rarr; <code>nightly/t1-lartpc-cuda12-20261101-{keys['ok']}.sif</code>", index)
         self.assertIn("5 builds: 2 succeeded, 2 failed, 1 need review", index)
+        self.assertIn("Base image: PyTorch <code>2.13.0+cu129</code>", index)
+        self.assertIn(f'href="builds/{keys["ok"]}-image.html"', index)
+        image = (out / "builds" / f"{keys['ok']}-image.html").read_text()
+        self.assertIn("differs", image)
+        self.assertIn("All 6 Python packages", image)
+        self.assertFalse((out / "builds" / f"{keys['rev']}-image.html").exists())
         pages = [out / "index.html", *(out / "builds").glob("*.html")]
         for page in pages:
             text = page.read_text()

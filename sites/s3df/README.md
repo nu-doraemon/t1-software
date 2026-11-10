@@ -120,6 +120,15 @@ relative, except the commit links to github.com. The pages work from the
 filesystem or from any static web server. The index shows a banner when
 the last poll failed, or when it is older than twice `POLL_INTERVAL_HOURS`.
 
+After a successful build, `run` inspects the `.sif` with
+`apptainer exec IMAGE python - < image_info.py` and writes
+`builds/<key>/image-info.json`. The build page shows the main versions
+(PyTorch, JAX, ROOT, Geant4, Python) and links to `<key>-image.html`.
+That page lists the core stack as pinned (from the base manifest) against
+installed, marks a mismatch "differs", and lists every Python package. A
+failed inspection is reported and does not fail the build; the page then
+has no base-image section.
+
 Each record stores `repos`, the clone URL of every tracked package. The
 build page links each commit to `<repo>/commit/<sha>` when the URL is on
 github.com. A record without `repos` shows plain commits.

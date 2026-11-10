@@ -202,19 +202,64 @@ def review_html(review_state):
     return f"<span class=\"{cls}\">{esc(review_state)}</span>"
 
 
+def nightly_build(link, records):
+    """The record whose .sif the nightly symlink points at, or None."""
+    if link is None or not os.path.islink(link):
+        return None
+    name = os.path.basename(os.readlink(link))
+    return next((r for r in records if name == image_file(r).name), None)
+
+
 def nightly_line(link, records):
     """The nightly symlink and the build it points at; "" when there is no link."""
     if link is None or not os.path.islink(link):
         return ""
     target = os.readlink(link)
-    name = os.path.basename(target)
-    build = next((r for r in records if name == image_file(r).name), None)
+    build = nightly_build(link, records)
     of = (f" (build <a href=\"builds/{esc(build['key'])}.html\"><code>{esc(build['key'])}</code></a>)"
           if build else "")
     return (f"Nightly image: <code>{esc(link)}</code> &rarr; <code>{esc(target)}</code>{of}<br>")
 
 
-def render_index(out, site, records, review_states, last_poll, nightly_link, now):
+KEY_COMPONENTS = ("PyTorch", "JAX", "ROOT", "Geant4", "Python")
+
+
+def key_versions(info):
+    """One line with the main versions of an image."""
+    vals = {r["name"]: r["installed"].split(" ")[0] for r in info["core"]}
+    return " &middot; ".join(f"{esc(n)} <code>{esc(vals[n])}</code>"
+                             for n in KEY_COMPONENTS if n in vals)
+
+
+def render_image_page(out, record, info):
+    """builds/<key>-image.html: facts, core stack (pinned vs installed), package list."""
+    key = record["key"]
+    facts = [("Image file", f"<code>{esc(info.get('sif'))}</code>"),
+             ("Size", f"{info['size'] / 1e9:.1f} GB" if info.get("size") else "-"),
+             ("Built", stamp(info.get("built_at"))),
+             ("Python packages", esc(len(info["pip"]))),
+             ("Conda packages", esc(info["conda_count"]))]
+    rows = []
+    for r in info["core"]:
+        pinned = esc(r["pinned"]) if r["pinned"] else "<span class=\"muted\">-</span>"
+        flag = " <span class=\"bad\">differs</span>" if r["differs"] else ""
+        note = f"<span class=\"muted\">{esc(r['note'])}</span>"
+        rows.append(("", [esc(r["name"]), pinned, esc(r["installed"]) + flag, note]))
+    pip_rows = "".join(f"<tr><td>{esc(n)}</td><td>{esc(v)}</td></tr>" for n, v in info["pip"])
+    body = (f"<p class=\"crumb\"><a href=\"../index.html\">&larr; all builds</a> / "
+            f"<a href=\"{esc(key)}.html\">build <code>{esc(key)}</code></a></p>"
+            "<dl class=\"kv\">" + "".join(f"<dt>{k}</dt><dd>{v}</dd>" for k, v in facts) + "</dl>"
+            "<h2>Core stack</h2>" + table(["component", "pinned", "installed", "note"], rows)
+            + f"<details><summary>All {len(info['pip'])} Python packages</summary>"
+            "<div class=\"scroll\" style=\"max-height:420px;overflow:auto\"><table><thead>"
+            "<tr><th>package</th><th>version</th></tr></thead>"
+            f"<tbody>{pip_rows}</tbody></table></div></details>")
+    write_atomic(out / "builds" / f"{key}-image.html",
+                 page(f"{INDEX_TITLE}: image of build {key}",
+                      f"Image of build <code>{esc(key)}</code>", body))
+
+
+def render_index(out, site, records, review_states, last_poll, nightly_link, nightly_info, now):
     parts = []
     for cls, text in banners(site, last_poll, now):
         parts.append(f"<div class=\"banner {cls}\">{esc(text)}</div>")
@@ -228,6 +273,9 @@ def render_index(out, site, records, review_states, last_poll, nightly_link, now
         meta.append(f"Last poll {esc(last_poll['time'])} ({esc(state)}). "
                     f"Rendered {esc(now.strftime('%Y-%m-%dT%H:%M:%SZ'))}.")
     parts.append(f"<p class=\"meta\">{nightly_line(nightly_link, records)}{'<br>'.join(meta)}</p>")
+    if nightly_info:
+        parts.append(f"<p class=\"meta\">Base image: {key_versions(nightly_info)} &middot; "
+                     f"<a href=\"builds/{esc(nightly_build(nightly_link, records)['key'])}-image.html\">details</a></p>")
     rows = []
     for rec in records:
         key = rec["key"]
@@ -257,7 +305,7 @@ def duration(record):
     return f"{minutes // 60} h {minutes % 60:02d} min"
 
 
-def render_build(out, record, review, review_state, src_dir):
+def render_build(out, record, review, review_state, src_dir, info=None):
     key = record["key"]
     logs = log_names(src_dir)
     changed = record.get("changed") or {}
@@ -302,6 +350,9 @@ def render_build(out, record, review, review_state, src_dir):
                 f"<dl class=\"kv\"><dt>Reviewed</dt><dd>{stamp(review.get('time'))} by "
                 f"{esc(review.get('user'))} (attempt {esc(review.get('attempt'))})</dd>"
                 f"<dt>Note</dt><dd>{esc(review.get('note'))}</dd></dl>")
+    if info:
+        parts.append(f"<h2>Base image</h2><p>{key_versions(info)} &middot; "
+                     f"<a href=\"{esc(key)}-image.html\">details</a></p>")
     parts.append("<h2>Logs</h2>")
     if logs:
         parts.append("<ul>" + "".join(
@@ -314,13 +365,19 @@ def render_build(out, record, review, review_state, src_dir):
         parts.append("<p class=\"muted\">No log yet.</p>")
     write_atomic(out / "builds" / f"{key}.html",
                  page(f"{INDEX_TITLE}: build {key}", f"Build <code>{esc(key)}</code>", "\n".join(parts)))
+    if info:
+        render_image_page(out, record, info)
 
 
 def render(out, *, site, records, reviews, review_states, last_poll, build_dirs,
-           nightly_link=None, now):
+           image_infos=None, nightly_link=None, now):
     out = Path(out)
+    image_infos = image_infos or {}
     (out / "builds").mkdir(parents=True, exist_ok=True)
-    render_index(out, site, records, review_states, last_poll, nightly_link, now)
+    nightly = nightly_build(nightly_link, records)
+    render_index(out, site, records, review_states, last_poll, nightly_link,
+                 image_infos.get(nightly["key"]) if nightly else None, now)
     for rec in records:
         key = rec["key"]
-        render_build(out, rec, reviews.get(key), review_states.get(key, ""), build_dirs[key])
+        render_build(out, rec, reviews.get(key), review_states.get(key, ""), build_dirs[key],
+                     image_infos.get(key))
