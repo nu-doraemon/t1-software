@@ -4,8 +4,11 @@
 # so the line goes on sdfcron001. Add it without dropping your existing
 # entries: `crontab -l > cron.txt`, append the line below to cron.txt,
 # then `crontab cron.txt`.
-# Cron's PATH lacks ~/.local/bin, so uv is called by its absolute path.
+# Cron's PATH is only /usr/bin:/bin. It lacks ~/.local/bin, so uv is
+# called by its absolute path. The line also sets PATH: sbatch and sacct
+# live in /opt/slurm/slurm-curr/bin on S3DF. The build job inherits this
+# PATH (sbatch --export ALL), and apptainer needs mksquashfs in /usr/sbin.
 # Replace /path/to/state and /path/to/t1-software.
 #
 # m h dom mon dow  -- daily poll on sdfcron001
-15 6 * * * T1_NIGHTLY_STATE=/path/to/state $HOME/.local/bin/uv run --script /path/to/t1-software/sites/s3df/nightly.py poll >> /path/to/state/cron.log 2>&1
+15 6 * * * PATH=/opt/slurm/slurm-curr/bin:/usr/bin:/bin:/usr/sbin T1_NIGHTLY_STATE=/path/to/state $HOME/.local/bin/uv run --script /path/to/t1-software/sites/s3df/nightly.py poll >> /path/to/state/cron.log 2>&1
