@@ -52,6 +52,8 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+import dashboard  # sites/s3df/dashboard.py; a script's own directory is on sys.path
+
 T1 = "T1_SOFTWARE_COMMIT"
 ACTIVE = ("queued", "running")
 RETRYABLE = ("failed", "interrupted", "cancelled")
@@ -475,15 +477,41 @@ def _poll(state, site, dry_run):
     return 0
 
 
+def refresh(state, site, out=None):
+    """Re-render the dashboard. Takes the ledger lock itself, so callers
+    must call it only after they released theirs (flock is not reentrant).
+    A render error never changes the caller's result; it is reported.
+    """
+    try:
+        with ledger_lock(state):
+            records = load_records(state)
+            reviews = {r["key"]: load_json(build_dir(state, r["key"]) / "review.json")
+                       for r in records}
+            dashboard.render(
+                Path(out or site["DASHBOARD_DIR"]), site=site, records=records,
+                reviews=reviews,
+                review_states={r["key"]: review_state(r, reviews[r["key"]]) for r in records},
+                last_poll=load_json(state / "last-poll.json"),
+                build_dirs={r["key"]: build_dir(state, r["key"]) for r in records},
+                now=datetime.now(timezone.utc))
+    except Exception as e:  # the dashboard must never break a poll or a build
+        print(f"render failed: {e}", file=sys.stderr, flush=True)
+        return False
+    return True
+
+
 def poll(state, dry_run):
     site = load_site(state)
     if dry_run:
         return _poll(state, site, True)
     with ledger_lock(state):
-        return _poll(state, site, False)
+        rc = _poll(state, site, False)
+    refresh(state, site)
+    return rc
 
 
 def review(state, key, note):
+    site = load_site(state)
     with ledger_lock(state):
         rec = load_json(record_path(state, key))
         if rec is None:
@@ -493,6 +521,7 @@ def review(state, key, note):
             "time": now_iso(), "user": getpass.getuser(), "note": note,
             "attempt": rec["attempts"],
         })
+    refresh(state, site)
     print(f"reviewed {key}")
     return 0
 
@@ -517,6 +546,7 @@ def retry(state, key):
         except SubmitError as e:
             print(f"sbatch failed: {e}", file=sys.stderr)
             return 1
+    refresh(state, site)
     print(f"retry {key} job {job_id} attempt {rec['attempts']}")
     return 0
 
@@ -552,8 +582,14 @@ def finish(state, key, status, stage):
 
 
 def run(state, key):
-    """Build one record inside its Slurm job."""
+    """Build one record inside its Slurm job, then re-render the dashboard."""
     site = load_site(state)
+    rc = _run(state, site, key)
+    refresh(state, site)
+    return rc
+
+
+def _run(state, site, key):
     with ledger_lock(state):
         rec = load_json(record_path(state, key))
         if rec is None:
@@ -678,6 +714,8 @@ def main(argv=None):
     add("status", "one line per build, newest first")
     p = add("run", "build one record (runs inside the Slurm job)")
     p.add_argument("key")
+    p = add("render", "write the static dashboard")
+    p.add_argument("--out", help="output directory (default: DASHBOARD_DIR from site.env)")
 
     args = parser.parse_args(argv)
     state_arg = args.state or os.environ.get("T1_NIGHTLY_STATE")
@@ -694,6 +732,8 @@ def main(argv=None):
             return retry(state, args.key)
         if args.cmd == "run":
             return run(state, args.key)
+        if args.cmd == "render":
+            return 0 if refresh(state, load_site(state), args.out) else 1
         if args.cmd == "status":
             return status(state)
     except UsageError as e:

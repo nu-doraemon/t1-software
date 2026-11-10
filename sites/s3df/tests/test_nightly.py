@@ -14,6 +14,7 @@ import importlib.util
 import io
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -535,6 +536,87 @@ class NightlyTest(unittest.TestCase):
         r = subprocess.run(["bash", str(SITE_DIR / "build.sbatch"), "/bin/echo", "a", "b", "c"],
                            stdout=subprocess.PIPE, text=True, check=True)
         self.assertEqual(r.stdout, "run --script a b c\n")
+
+    # -- dashboard ---------------------------------------------------------
+
+    def dashboard_fixture(self, poll_age_hours=49, ok=True, error=None):
+        """Four hand-made records and a last-poll.json poll_age_hours old."""
+        f = self.fixture()
+        img = f.root / "img" / "nightly"
+        img.mkdir(parents=True)
+        keys = {}
+        for i, (name, status, attempts) in enumerate([
+                ("ok", "success", 1), ("rev", "failed", 1), ("bad", "failed", 1),
+                ("int", "interrupted", 2)]):
+            key = f"{name:0<12}"[:12]
+            keys[name] = key
+            tag = f"20261101-{key}"
+            d = nightly.build_dir(f.state, key)
+            d.mkdir(parents=True)
+            nightly.write_json(d / "record.json", {
+                "key": key, "variant": "cuda12", "t1_software_commit": "a" * 40,
+                "pins": {"PKG_COMMIT": "b" * 40}, "changed": {"PKG_COMMIT": [None, "b" * 40]},
+                "status": status, "failed_stage": "stage-two" if status == "failed" else None,
+                "attempts": attempts, "slurm_job_ids": [str(100 + i)],
+                "queued_at": f"2026-11-0{i + 1}T00:00:00Z", "started_at": None,
+                "finished_at": None, "tag": tag, "images_dir": str(img)})
+            (d / "build.log").write_text("== stage-one ==\n<b>log</b>\n")
+            if name == "ok":
+                (img / f"t1-lartpc-cuda12-{tag}.sif").write_text("x")
+            if name == "rev":
+                nightly.write_json(d / "review.json", {"time": "t", "user": "u",
+                                                       "note": "upstream bug", "attempt": 1})
+        when = datetime.now(timezone.utc).timestamp() - poll_age_hours * 3600
+        nightly.write_json(f.state / "last-poll.json", {
+            "time": datetime.fromtimestamp(when, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "ok": ok, "error": error, "heads": {}})
+        return f, keys
+
+    def index_row(self, index_html, key):
+        row = [line for line in index_html.splitlines() if f"builds/{key}.html" in line]
+        self.assertEqual(len(row), 1)
+        return row[0]
+
+    def test_render_pages(self):
+        f, keys = self.dashboard_fixture()
+        out = f.root / "out"
+        rc, _, err = f.main("render", "--out", str(out))
+        self.assertEqual(rc, 0, err)
+        index = (out / "index.html").read_text()
+        for key in keys.values():
+            self.assertTrue((out / "builds" / f"{key}.html").exists())
+        self.assertIn("Poller stale", index)
+        self.assertIn("reviewed", self.index_row(index, keys["rev"]))
+        self.assertIn("needs review", self.index_row(index, keys["bad"]))
+        self.assertIn("yes", self.index_row(index, keys["ok"]))
+        pages = [out / "index.html", *(out / "builds").glob("*.html")]
+        for page in pages:
+            text = page.read_text()
+            self.assertNotRegex(text, r"<script|\son\w+=|href=\"/|href=\"[a-z]+:")
+            self.assertNotIn("<b>log</b>", text)  # log text is escaped
+            for href in re.findall(r'href="([^"]+)"', text):
+                self.assertTrue((page.parent / href).exists(), f"{page}: {href}")
+
+    def test_no_banner_when_fresh(self):
+        f, _ = self.dashboard_fixture(poll_age_hours=1)
+        f.main("render", "--out", str(f.root / "out"))
+        self.assertNotIn("Poller stale", (f.root / "out" / "index.html").read_text())
+
+    def test_error_banner(self):
+        f, _ = self.dashboard_fixture(poll_age_hours=1, ok=False, error="boom")
+        f.main("render", "--out", str(f.root / "out"))
+        self.assertIn("Last poll failed: boom", (f.root / "out" / "index.html").read_text())
+
+    def test_review_flips_row(self):
+        f, keys = self.dashboard_fixture(poll_age_hours=1)
+        f.main("render")
+        index = f.state / "site" / "index.html"
+        self.assertIn("needs review", self.index_row(index.read_text(), keys["bad"]))
+        rc, _, _ = f.main("review", keys["bad"], "--note", "x")
+        self.assertEqual(rc, 0)
+        row = self.index_row(index.read_text(), keys["bad"])
+        self.assertIn("reviewed", row)
+        self.assertNotIn("needs review", row)
 
 
 if __name__ == "__main__":
