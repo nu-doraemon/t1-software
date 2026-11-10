@@ -50,8 +50,9 @@ WORKDIR /opt
 # files, so the pixel readout -> label matching chain fails without it.
 # JAXTPC's own requirements.txt is bounded (jax>=0.4,<0.7) so it never
 # clobbers the base image's JAX pin; Torch is not in that file at all.
+ARG JAXTPC_REPO
 ARG JAXTPC_COMMIT
-RUN git clone --quiet https://github.com/drinkingkazu/JAXTPC.git \
+RUN git clone --quiet "${JAXTPC_REPO}" JAXTPC \
  && git -C JAXTPC checkout --quiet "${JAXTPC_COMMIT}" \
  && python3 -m pip install --no-cache-dir -r JAXTPC/requirements.txt
 
@@ -63,9 +64,10 @@ RUN git clone --quiet https://github.com/drinkingkazu/JAXTPC.git \
 # Fetched by SHA, not cloned: upstream rewrote its history, so the pinned
 # commit is on no branch any more and `git clone` no longer receives it.
 # GitHub still serves it by SHA, but may garbage-collect it at any time.
+ARG PIMM_DATA_REPO
 ARG PIMM_DATA_COMMIT
 RUN git init --quiet pimm-data \
- && git -C pimm-data remote add origin https://github.com/omaralterkait/pimm-data.git \
+ && git -C pimm-data remote add origin "${PIMM_DATA_REPO}" \
  && git -C pimm-data fetch --quiet origin "${PIMM_DATA_COMMIT}" \
  && git -C pimm-data checkout --quiet FETCH_HEAD \
  && python3 -m pip install --no-cache-dir -e "/opt/pimm-data[test]"
@@ -79,8 +81,9 @@ RUN git init --quiet pimm-data \
 # potentially skewed JAXTPC commit. goop's multi-GB photon-library asset
 # (default /sdf/data/neutrino/youngsam/compressed_plib_b04_quantile_log_n50.h5)
 # is a host-side file read at runtime, never baked into the image.
+ARG GOOP_REPO
 ARG GOOP_COMMIT
-RUN git clone --quiet https://github.com/CIDeR-ML/goop.git \
+RUN git clone --quiet "${GOOP_REPO}" goop \
  && git -C goop checkout --quiet "${GOOP_COMMIT}"
 
 # goop's chroma sampler: chroma-lar (detector geometries), TriChroma
@@ -95,14 +98,17 @@ RUN git clone --quiet https://github.com/CIDeR-ML/goop.git \
 # else in this image imports triton directly. torch.compile on the base
 # Torch still runs a GPU kernel with this Triton (checked by
 # tests/image-test.sh).
+ARG TRICHROMA_REPO
 ARG TRICHROMA_COMMIT
+ARG PHOTONLIB_REPO
 ARG PHOTONLIB_COMMIT
+ARG CHROMA_LAR_REPO
 ARG CHROMA_LAR_COMMIT
 ARG TRICHROMA_TRITON_VERSION
 RUN python3 -m pip install --no-cache-dir --no-deps \
-        "trichroma @ git+https://github.com/youngsm/trichroma.git@${TRICHROMA_COMMIT}" \
-        "photonlib @ git+https://github.com/CIDeR-ML/photonlib.git@${PHOTONLIB_COMMIT}" \
-        "chroma-lar @ git+https://github.com/youngsm/chroma-lar.git@${CHROMA_LAR_COMMIT}" \
+        "trichroma @ git+${TRICHROMA_REPO}@${TRICHROMA_COMMIT}" \
+        "photonlib @ git+${PHOTONLIB_REPO}@${PHOTONLIB_COMMIT}" \
+        "chroma-lar @ git+${CHROMA_LAR_REPO}@${CHROMA_LAR_COMMIT}" \
  && python3 -m pip install --no-cache-dir --no-deps "triton==${TRICHROMA_TRITON_VERSION}"
 
 # Editable, like pimm-data: the campaign configs and dprod's provenance
@@ -112,8 +118,9 @@ RUN python3 -m pip install --no-cache-dir --no-deps \
 # above, so pip resolves nothing new. The gpu/numba/wandb extras stay
 # out: no GPU library beyond the base's Torch/JAX is needed for CPU label
 # matching, and torch/psutil are already present.
+ARG PYSUPERA_REPO
 ARG PYSUPERA_COMMIT
-RUN git clone --quiet https://github.com/drinkingkazu/pysupera.git \
+RUN git clone --quiet "${PYSUPERA_REPO}" pysupera \
  && git -C pysupera checkout --quiet "${PYSUPERA_COMMIT}" \
  && python3 -m pip install --no-cache-dir -e "/opt/pysupera[app]"
 
@@ -121,14 +128,17 @@ RUN git clone --quiet https://github.com/drinkingkazu/pysupera.git \
 # on PYTHONPATH and run `python3 -m doraemon_prod`, so the clone is used
 # in place (bin/ goes on PATH through the ENV below). Needs only
 # PyYAML + h5py (conda, above) and git for provenance.
+ARG DPROD_REPO
 ARG DPROD_COMMIT
-RUN git clone --quiet https://github.com/drinkingkazu/dprod.git \
+RUN git clone --quiet "${DPROD_REPO}" dprod \
  && git -C dprod checkout --quiet "${DPROD_COMMIT}"
 
 # DLPGenerator then edep-sim, in one step: edep-sim links DLPGenerator's
 # build, so a DLPGenerator bump must rebuild edep-sim too (see
 # build/build-generators.sh).
+ARG DLPGENERATOR_REPO
 ARG DLPGENERATOR_COMMIT
+ARG EDEPSIM_REPO
 ARG EDEPSIM_COMMIT
 COPY subgroups/lartpc/build/build-generators.sh /tmp/build-generators.sh
 RUN bash /tmp/build-generators.sh && rm /tmp/build-generators.sh

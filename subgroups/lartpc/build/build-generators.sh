@@ -6,15 +6,15 @@
 # "/generator/kinematics/set bomb" seam, so the build order is
 # load-bearing). Both build with conda's own compiler via
 # /opt/setup-g4root.sh -- the same GCC series ROOT/GEANT4 were built
-# with. Pins come from the DLPGENERATOR_COMMIT and EDEPSIM_COMMIT build
-# args. bash, not sh: DLPGenerator's setup.sh is bash-only
+# with. Pins and clone URLs come from the DLPGENERATOR_{REPO,COMMIT} and
+# EDEPSIM_{REPO,COMMIT} build args. bash, not sh: DLPGenerator's setup.sh is bash-only
 # (`${BASH_SOURCE[0]}`, `[[ ]]`). No `-u`: neither setup.sh nor conda's
 # hooks are nounset-safe.
 set -e
 source /opt/setup-g4root.sh
 
 cd /opt
-git clone --quiet https://github.com/DeepLearnPhysics/DLPGenerator.git
+git clone --quiet "${DLPGENERATOR_REPO:?}" DLPGenerator
 cd DLPGenerator
 git checkout --quiet "${DLPGENERATOR_COMMIT:?}"
 # Upstream's setup.sh exports DLPGENERATOR_{DIR,LIBDIR,INCDIR,...};
@@ -28,7 +28,7 @@ make test
 chmod +x bin/dlpgen
 
 cd /opt
-git clone --quiet https://github.com/drinkingkazu/edep-sim.git
+git clone --quiet "${EDEPSIM_REPO:?}" edep-sim
 cd edep-sim
 git checkout --quiet "${EDEPSIM_COMMIT:?}"
 mkdir -p build && cd build

@@ -1,7 +1,8 @@
 # Built container images are large, ephemeral, rebuildable-from-recipe
 # binaries -- never git-tracked. Default output directory is ./images
-# (redirect it via $T1_SOFTWARE_IMAGES_DIR -- see scripts/nightly-build.sh);
-# ignore it and any stray .sif that ends up alongside it.
+# (redirect it with `scripts/build.sh --images-dir`); ignore it and any
+# stray .sif that ends up alongside it.
 images/
 *.sif
 *.sandbox/
+__pycache__/

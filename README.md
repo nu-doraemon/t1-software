@@ -18,7 +18,7 @@ t1-software/
 +-- subgroups/
 |   +-- lartpc/
 |       +-- Containerfile   # FROM t1-base -> clones + pins JAXTPC, pimm-data, goop (+ chroma-lar, TriChroma, photonlib, Triton override), DLPGenerator, edep-sim, pysupera, dprod
-|       +-- versions.env    # JAXTPC_COMMIT, PIMM_DATA_COMMIT, GOOP_COMMIT, CHROMA_LAR_COMMIT, TRICHROMA_COMMIT, PHOTONLIB_COMMIT, TRICHROMA_TRITON_VERSION, DLPGENERATOR_COMMIT, EDEPSIM_COMMIT, PYSUPERA_COMMIT, DPROD_COMMIT
+|       +-- versions.env    # <PKG>_REPO clone URL + <PKG>_COMMIT pin per package (JAXTPC, pimm-data, goop, chroma-lar, TriChroma, photonlib, DLPGenerator, edep-sim, pysupera, dprod), TRICHROMA_TRITON_VERSION
 |       +-- build/build-generators.sh   # DLPGenerator + edep-sim build, run inside the image build
 |       +-- tests/
 |           +-- image-test.sh               # all in-image checks (imports, seams, vendored unit suites)
@@ -26,16 +26,37 @@ t1-software/
 |           +-- test_generator_edepsim.sh   # DLPGenerator -> edep-sim seam smoke test (bomb-macro -> H5DLP)
 |           +-- dprod_site_image.yaml       # dprod site config: in-image checkouts, local scheduler, no nested container
 +-- scripts/
-|   +-- nightly-build.sh   # podman build of both layers, tests, .sif conversion, dprod full-chain test
+|   +-- build.sh           # podman build of both layers, tests, .sif conversion, dprod full-chain test
 |   +-- dprod-pipeline-test.sh  # dprod-install-test inside a built lartpc image (GPU node)
-+-- images/                 # gitignored default output dir (override via $T1_SOFTWARE_IMAGES_DIR)
+|   +-- tests/             # fast tests of build.sh with fake podman/apptainer
++-- sites/s3df/            # nightly HEAD builds on S3DF (cron + Slurm + build ledger + dashboard)
++-- images/                # gitignored default output dir (override with --images-dir)
 ```
 
-## Building locally
+## Building
 
 ```bash
-scripts/nightly-build.sh          # cuda12, the only variant built today
+scripts/build.sh                  # cuda12, the pins in versions.env
+scripts/build.sh --help           # every option and its default
 ```
+
+| Option | Default |
+|---|---|
+| `--variant NAME` | `cuda12` (the only variant built today) |
+| `--work-dir DIR` | `$LSCRATCH/t1-software-build` if `$LSCRATCH` is set, else `${TMPDIR:-/tmp}/t1-software-build` |
+| `--images-dir DIR` | `$T1_SOFTWARE_IMAGES_DIR`, else `images/` next to this repo |
+| `--cache-dir DIR` | `$T1_SOFTWARE_CACHE_DIR`; unset means node-local cache only |
+| `--pin KEY=VALUE` | none; overrides one `versions.env` key for this build; repeatable |
+| `--tag TAG` | `<YYYYMMDD>-<git-sha8>[-dirty]` |
+| `--no-sif` | off; skips the `.sif`, the apptainer tests and the pipeline test |
+| `--no-pipeline-test` | off; on when `T1_SKIP_PIPELINE_TEST=1` |
+| `--gpu auto\|on\|off` | `auto`: apptainer tests get `--nv` when `nvidia-smi` finds a GPU |
+| `--squashfs-mem SIZE` | `2G` |
+
+`--pin` builds any commit set without editing a file. Example:
+`scripts/build.sh --pin GOOP_COMMIT=<sha>` builds goop at `<sha>`. A key
+that is in neither `versions.env` is an error, and the script stops
+before it starts podman. The manifests record every pin that was used.
 
 Requires rootless `podman` and `apptainer`. No `/etc/subuid` or
 `/etc/subgid` entry is needed: the script sets
@@ -43,27 +64,27 @@ Requires rootless `podman` and `apptainer`. No `/etc/subuid` or
 `chown` to other users, so every file in the image is owned by the build
 user), and the Containerfiles run apt's sandbox as root.
 
-Podman storage, temp files, and the staged outputs live under
-`$LSCRATCH/t1-software-build/` (required). Rootless overlay needs a local
-filesystem, and writing multi-GB files straight to a shared/NFS images
-dir is much slower than one local write plus one move. Plan for about
-80 GB there: about 25 GB of layers plus the archives and the `.sif`. To
-clear the storage, run:
+Podman storage, temp files, and the staged outputs live in the work dir.
+Put it on a node-local disk: rootless overlay needs a local filesystem,
+and writing multi-GB files straight to a shared/NFS images dir is much
+slower than one local write plus one move. Plan for about 80 GB there:
+about 25 GB of layers plus the archives and the `.sif`. To clear the
+storage, run:
 
 ```bash
-podman --root $LSCRATCH/t1-software-build/podman/root \
-       --runroot $LSCRATCH/t1-software-build/podman/run system reset -f
+podman --root <work-dir>/podman/root \
+       --runroot <work-dir>/podman/run system reset -f
 ```
 
 Plain `rm -rf` fails on busy overlay mounts.
 
 Final images land in `images/` next to this repo by default (gitignored
--- see `.gitignore`). Set `$T1_SOFTWARE_IMAGES_DIR` before invoking the
-script to redirect them elsewhere -- e.g. a workspace embedding this repo
-under its own `src/` typically points it at that workspace's own image
-store rather than accepting the default. Re-running is idempotent per tag
-(see below): the same commit on the same day overwrites its own dated
-files, and always re-points the `-latest` symlinks.
+-- see `.gitignore`). Pass `--images-dir` (or set
+`$T1_SOFTWARE_IMAGES_DIR`) to redirect them elsewhere -- e.g. a workspace
+embedding this repo under its own `src/` typically points it at its own
+image store. Re-running is idempotent per tag (see below): the same
+commit on the same day overwrites its own dated files, and always
+re-points the `-latest` symlinks.
 
 Memory: request at least 16 GB for the job. JAXTPC's unit suite alone
 peaks at about 10.7 GB RSS, and the apptainer test run is charged to
@@ -71,23 +92,30 @@ the job's cgroup. An 8 GB allocation OOM-kills it. (Rootless podman
 containers run outside the Slurm job cgroup, so the podman test run
 passes even there.)
 
+`scripts/tests/` tests the option, pin, tag, file-set and manifest logic
+in seconds, with fake `podman` and `apptainer` on `PATH`:
+
+```bash
+python3 -m unittest discover -s scripts/tests -v
+```
+
 ### Layer cache
 
 Each pinned package is its own build step, placed after its own `ARG`.
 A rebuild reuses every step above the first changed pin. By default the
-cache lives in the podman storage on `$LSCRATCH`, so only the next build
-on the same node reuses it.
+cache lives in the podman storage in the work dir, so only the next
+build on the same node reuses it.
 
-To share the cache across nodes, point `$T1_SOFTWARE_CACHE_DIR` at a
-persistent directory on shared storage:
+To share the cache across nodes, pass `--cache-dir` (or set
+`$T1_SOFTWARE_CACHE_DIR`) to a persistent directory on shared storage:
 
 ```bash
-T1_SOFTWARE_CACHE_DIR=/path/to/shared/t1-software-cache scripts/nightly-build.sh
+scripts/build.sh --cache-dir /path/to/shared/t1-software-cache
 ```
 
 During the two builds, the script runs a registry container
 (`registry:2.8.3`, loopback only, random port) whose blob store is
-`$T1_SOFTWARE_CACHE_DIR/registry`, and builds with `--cache-from` /
+`<cache-dir>/registry`, and builds with `--cache-from` /
 `--cache-to` against it. No external registry or account is involved.
 
 - **Size:** one full set of layers is about 14 GB (6.4 GB of it is the
@@ -96,7 +124,7 @@ During the two builds, the script runs a registry container
   ROOT/Geant4/Python. Nothing is pruned; plan for about 50 GB and delete
   the directory when it exceeds that. The next build repopulates it.
 - **Concurrency:** one build at a time. A second build fails fast on
-  `$T1_SOFTWARE_CACHE_DIR/.lock`. The lock is released once the builds
+  `<cache-dir>/.lock`. The lock is released once the builds
   finish, before the tests start.
 - **Not cached:** the `FROM nvidia/cuda` base is pulled from Docker Hub
   on a node that does not have it yet.
@@ -109,13 +137,21 @@ During the two builds, the script runs a registry container
   pysupera. They run twice: under podman (CPU) and under apptainer on
   the converted `.sif` (`--nv` when a GPU is present). No GPU is wired
   into podman.
-- `scripts/dprod-pipeline-test.sh <lartpc.sif>`: dprod's own
-  `dprod-install-test` inside the image -- one job through edep-sim ->
+- `scripts/dprod-pipeline-test.sh [--work-dir DIR] <lartpc.sif>`: dprod's
+  own `dprod-install-test` inside the image -- one job through edep-sim ->
   JAXTPC (wire) -> pysupera -> JAXTPC (pixel) -> pysupera with dprod's
   local scheduler (no slurm), then dprod's event-id and provenance-chain
-  checks. It needs a GPU (`--nv`); `nightly-build.sh` runs it before any
-  image leaves scratch and fails on a GPU-less node unless
-  `T1_SKIP_PIPELINE_TEST=1`. It also runs standalone against any built image.
+  checks. It needs a GPU (`--nv`); `build.sh` runs it before any image
+  leaves the work dir and fails on a GPU-less node unless
+  `--no-pipeline-test` (or `T1_SKIP_PIPELINE_TEST=1`). It also runs
+  standalone against any built image.
+
+## Nightly builds
+
+`sites/s3df/` builds the HEAD of every tracked package once a day on
+S3DF, keeps a ledger of every build, and renders a static dashboard. It
+calls `build.sh` with `--pin` and `--tag` and never edits this repo. See
+`sites/s3df/README.md`; another site can copy that directory.
 
 ## Using the images
 
@@ -153,7 +189,7 @@ so unrelated builds never pick them up.
 
 ## Image versioning
 
-Every file `nightly-build.sh` produces is named:
+Every file `build.sh` produces is named (with the default tag):
 
 ```
 <layer>-<cuda-variant>-<YYYYMMDD>-<git-sha>[-dirty].{oci.tar,sif,manifest.json}
@@ -181,15 +217,15 @@ Per build:
 
 `t1-lartpc-<variant>-latest.sif`, `t1-lartpc-<variant>-latest.oci.tar`
 and `t1-base-<variant>-latest.oci.tar` are symlinks to the newest dated
-build. **These are the pointers to follow for "the latest nightly
-build"**; scripts and downstream consumers should target them (e.g.
-`images/t1-lartpc-cuda12-latest.sif`) rather than a dated filename,
-unless they specifically need to pin an exact historical build. The
-symlinks are updated atomically (write-then-rename) on every successful
-run.
+build in the same images dir. **These are the pointers to follow for
+"the latest build"**; scripts and downstream consumers should target
+them (e.g. `images/t1-lartpc-cuda12-latest.sif`) rather than a dated
+filename, unless they specifically need to pin an exact historical
+build. The symlinks are updated atomically (write-then-rename) on every
+successful run.
 
-Dated images accumulate across runs (nothing here prunes old builds);
-that is a deliberate simplification for now, not a limitation.
+`build.sh` itself prunes nothing; dated images accumulate. The nightly
+layer in `sites/s3df/` prunes its own old images.
 
 ## Adding a new detector-technology subgroup
 
@@ -199,4 +235,4 @@ third-party pins, its runtime paths as `ENV` lines ending with `RUN
 /opt/t1-runtime/check-env.sh`, and a `tests/` directory with an
 `image-test.sh` plus
 at least one integration smoke test proving the subgroup's own
-data-pipeline seam. Wire it into `scripts/nightly-build.sh`.
+data-pipeline seam. Wire it into `scripts/build.sh`.
