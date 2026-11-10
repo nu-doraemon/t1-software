@@ -34,6 +34,10 @@ GIT_ENV = {
     "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1",
 }
 
+# Environment variables the tests set; setUp clears them, tearDown restores them.
+FAKE_VARS = ("T1_NIGHTLY_STATE", "FAKE_SBATCH_RC", "FAKE_BUILD_RC", "FAKE_ARGV", "FAKE_SEEN",
+             "FAKE_EXTRA_LINE", "FAKE_ENV_PROBE", "T1_SKIP_PIPELINE_TEST")
+
 FAKE_SBATCH = textwrap.dedent("""\
     #!/bin/bash
     root="$(dirname "$(dirname "$0")")"
@@ -68,6 +72,7 @@ FAKE_BUILD = textwrap.dedent("""\
     #!/bin/bash
     [[ -n "${FAKE_ARGV:-}" ]] && printf '%s\\n' "$@" > "$FAKE_ARGV"
     [[ -n "${FAKE_SEEN:-}" ]] && cat marker.txt > "$FAKE_SEEN"
+    [[ -n "${FAKE_ENV_PROBE:-}" ]] && env > "$FAKE_ENV_PROBE"
     echo "== stage-one =="
     [[ -n "${FAKE_EXTRA_LINE:-}" ]] && echo "$FAKE_EXTRA_LINE"
     echo "== stage-two =="
@@ -193,11 +198,10 @@ class Fixture:
 
 class NightlyTest(unittest.TestCase):
     def setUp(self):
-        self._env = {k: os.environ.get(k) for k in [*GIT_ENV, "T1_NIGHTLY_STATE",
-                                                     "FAKE_SBATCH_RC"]}
+        self._env = {k: os.environ.get(k) for k in [*GIT_ENV, *FAKE_VARS]}
         os.environ.update(GIT_ENV)
-        os.environ.pop("T1_NIGHTLY_STATE", None)
-        os.environ.pop("FAKE_SBATCH_RC", None)
+        for k in FAKE_VARS:
+            os.environ.pop(k, None)
         self._tmps = []
 
     def tearDown(self):
@@ -403,6 +407,134 @@ class NightlyTest(unittest.TestCase):
         self.assertFalse((f.state / "last-poll.json").exists())
         self.assertFalse((f.state / "poll.log").exists())
         self.assertEqual(f.calls(), [])
+
+    # -- run ---------------------------------------------------------------
+
+    def polled(self):
+        """Fixture after one poll, with FAKE_ARGV/FAKE_SEEN set."""
+        f = self.fixture()
+        f.poll()
+        os.environ["FAKE_ARGV"] = str(f.root / "argv.txt")
+        os.environ["FAKE_SEEN"] = str(f.root / "seen.txt")
+        return f, f.only_record()
+
+    def test_run_success_args(self):
+        f, rec = self.polled()
+        f.site["VARIANT"] = "other"
+        f.write_site()
+        os.environ["T1_SKIP_PIPELINE_TEST"] = "1"
+        os.environ["FAKE_ENV_PROBE"] = str(f.root / "env.txt")
+        rc, out, _ = f.main("run", rec["key"])
+        self.assertEqual(rc, 0)
+        done = f.only_record()
+        self.assertEqual(done["status"], "success")
+        self.assertIsNone(done["failed_stage"])
+        self.assertIsNotNone(done["started_at"])
+        self.assertIsNotNone(done["finished_at"])
+        argv = (f.root / "argv.txt").read_text().splitlines()
+        for a, b in [("--variant", "cuda12"), ("--images-dir", str(f.root / "img" / "nightly")),
+                     ("--tag", rec["tag"]), ("--pin", f"PKG_COMMIT={f.A}"),
+                     ("--work-dir", str(f.root / "work"))]:
+            self.assertEqual(argv[argv.index(a) + 1], b)
+        self.assertNotIn("T1_SKIP_PIPELINE_TEST=1", (f.root / "env.txt").read_text())
+        self.assertIn("== stage-two ==", out)
+        self.assertFalse((f.root / "work" / "t1-nightly" / f"{rec['key']}-src").exists())
+
+    def test_run_failure_stage(self):
+        f, rec = self.polled()
+        os.environ["FAKE_BUILD_RC"] = "1"
+        rc, _, _ = f.main("run", rec["key"])
+        self.assertEqual(rc, 1)
+        done = f.only_record()
+        self.assertEqual(done["status"], "failed")
+        self.assertEqual(done["failed_stage"], "stage-two")
+
+    def test_run_cache_lock(self):
+        f, rec = self.polled()
+        os.environ["FAKE_BUILD_RC"] = "1"
+        os.environ["FAKE_EXTRA_LINE"] = ("build.sh: another build holds /x/.lock; "
+                                         "retry later or drop --cache-dir")
+        f.main("run", rec["key"])
+        self.assertEqual(f.only_record()["failed_stage"], "cache lock")
+
+    def test_run_checkout_failure(self):
+        f, rec = self.polled()
+        f.set_status(rec["key"], "queued", t1_software_commit="0" * 40)
+        rc, _, err = f.main("run", rec["key"])
+        self.assertEqual(rc, 1)
+        done = f.only_record()
+        self.assertEqual(done["status"], "failed")
+        self.assertEqual(done["failed_stage"], "checkout")
+
+    def test_run_ignores_checkout_edits(self):
+        f = self.fixture()
+        work = f.root / "t1work"
+        f.git("clone", "--quiet", str(f.t1_git), str(work))
+        f.git("-C", str(work), "config", "uploadpack.allowAnySHA1InWant", "true")
+        f.site["T1_SOFTWARE_REPO"] = f"file://{work}"
+        f.write_site()
+        f.poll()
+        rec = f.only_record()
+        (work / "marker.txt").write_text("dirty\n")
+
+        def snapshot():
+            return [f.git("-C", str(work), *args) for args in
+                    (["status", "--porcelain"], ["rev-parse", "HEAD"],
+                     ["branch", "--show-current"], ["for-each-ref"])]
+
+        before = snapshot()
+        os.environ["FAKE_SEEN"] = str(f.root / "seen.txt")
+        rc, _, _ = f.main("run", rec["key"])
+        self.assertEqual(rc, 0)
+        self.assertEqual((f.root / "seen.txt").read_text(), "committed\n")
+        self.assertEqual(snapshot(), before)
+
+    # -- prune -------------------------------------------------------------
+
+    def test_prune(self):
+        f = self.fixture()
+        f.site["NIGHTLY_KEEP"] = "2"
+        f.write_site()
+        img = f.root / "img" / "nightly"
+        img.mkdir(parents=True)
+
+        def record(key, status, day, files):
+            tag = f"202611{day:02d}-{key}"
+            d = nightly.build_dir(f.state, key)
+            d.mkdir(parents=True)
+            nightly.write_json(d / "record.json", {
+                "key": key, "status": status, "variant": "cuda12", "tag": tag,
+                "images_dir": str(img), "queued_at": f"2026-11-{day:02d}T00:00:00Z",
+                "finished_at": f"2026-11-{day:02d}T01:00:00Z", "slurm_job_ids": [str(day)]})
+            for name in files:
+                (img / name.format(tag=tag)).write_text("x")
+            return tag
+
+        files = ["t1-lartpc-cuda12-{tag}.sif", "t1-lartpc-cuda12-{tag}.oci.tar",
+                 "t1-base-cuda12-{tag}.oci.tar", "t1-lartpc-cuda12-{tag}.manifest.json"]
+        old_failed = record("f00000000000", "failed", 1, ["t1-lartpc-cuda12-{tag}.sif"])
+        d1 = record("d10000000000", "success", 2, files)
+        d2 = record("d20000000000", "success", 3, files)
+        d3 = record("d30000000000", "success", 4, files)
+        (img / "t1-lartpc-cuda12-latest.sif").symlink_to(f"t1-lartpc-cuda12-{d1}.sif")
+        with contextlib.redirect_stdout(io.StringIO()):
+            nightly.prune(f.state, nightly.load_site(f.state))
+        names = {p.name for p in img.iterdir()}
+        self.assertIn(f"t1-lartpc-cuda12-{d1}.sif", names)
+        self.assertNotIn(f"t1-lartpc-cuda12-{d1}.oci.tar", names)
+        self.assertNotIn(f"t1-base-cuda12-{d1}.oci.tar", names)
+        for tag in (d2, d3):
+            for name in files:
+                self.assertIn(name.format(tag=tag), names)
+        for tag in (d1, d2, d3):
+            self.assertIn(f"t1-lartpc-cuda12-{tag}.manifest.json", names)
+        self.assertIn(f"t1-lartpc-cuda12-{old_failed}.sif", names)
+        self.assertIn("t1-lartpc-cuda12-latest.sif", names)
+
+    def test_build_sbatch(self):
+        r = subprocess.run(["bash", str(SITE_DIR / "build.sbatch"), "/bin/echo", "a", "b", "c"],
+                           stdout=subprocess.PIPE, text=True, check=True)
+        self.assertEqual(r.stdout, "run --script a b c\n")
 
 
 if __name__ == "__main__":

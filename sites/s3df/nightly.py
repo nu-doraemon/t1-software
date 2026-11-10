@@ -46,6 +46,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -470,6 +471,7 @@ def _poll(state, site, dry_run):
 
     if not dry_run:
         write_json(state / "last-poll.json", ok)
+        prune(state, site)
     return 0
 
 
@@ -529,6 +531,127 @@ def status(state):
     return 0
 
 
+# The record and site.env alone decide a nightly build, not the
+# environment of whoever ran poll or retry (sbatch --export ALL).
+BUILD_ENV_DROP = ("T1_SOFTWARE_IMAGES_DIR", "T1_SOFTWARE_CACHE_DIR", "T1_SKIP_PIPELINE_TEST")
+STAGE_LINE = re.compile(r"== (.*) ==")
+
+
+def scratch_base(site):
+    for value in (site["WORK_DIR"], os.environ.get("LSCRATCH"), os.environ.get("TMPDIR")):
+        if value:
+            return Path(value)
+    return Path("/tmp")
+
+
+def finish(state, key, status, stage):
+    with ledger_lock(state):
+        rec = load_json(record_path(state, key))
+        rec.update(status=status, failed_stage=stage, finished_at=now_iso())
+        save_record(state, rec)
+
+
+def run(state, key):
+    """Build one record inside its Slurm job."""
+    site = load_site(state)
+    with ledger_lock(state):
+        rec = load_json(record_path(state, key))
+        if rec is None:
+            print(f"no record {key}", file=sys.stderr)
+            return 1
+        rec.update(status="running", started_at=now_iso())
+        save_record(state, rec)
+
+    # A scratch clone at the recorded commit: the image matches the key
+    # even if the branch moved since the poll, and no checkout is touched.
+    src = scratch_base(site) / "t1-nightly" / f"{key}-src"
+    shutil.rmtree(src, ignore_errors=True)
+    src.parent.mkdir(parents=True, exist_ok=True)
+    print(f"nightly: fetching t1-software {rec['t1_software_commit']} into {src}", flush=True)
+    try:
+        git("init", "--quiet", str(src))
+        git("-C", str(src), "fetch", "--quiet", "--depth", "1",
+            site["T1_SOFTWARE_REPO"], rec["t1_software_commit"])
+        git("-C", str(src), "checkout", "--quiet", "FETCH_HEAD")
+    except PollError as e:
+        print(f"nightly: checkout failed: {e}", file=sys.stderr, flush=True)
+        finish(state, key, "failed", "checkout")
+        shutil.rmtree(src, ignore_errors=True)
+        return 1
+
+    cmd = [str(src / "scripts" / "build.sh"), "--variant", rec["variant"],
+           "--images-dir", rec["images_dir"], "--tag", rec["tag"]]
+    for k, v in sorted(rec["pins"].items()):
+        cmd += ["--pin", f"{k}={v}"]
+    if site["CACHE_DIR"]:
+        cmd += ["--cache-dir", site["CACHE_DIR"]]
+    if site["WORK_DIR"]:
+        cmd += ["--work-dir", site["WORK_DIR"]]
+    env = {k: v for k, v in os.environ.items() if k not in BUILD_ENV_DROP}
+
+    # Slurm sends SIGTERM on scancel, preemption and time limit. Pass it to
+    # build.sh and leave the record `running`: poll reads the real cause
+    # from sacct.
+    interrupted = False
+    proc = None
+
+    def on_signal(signum, frame):
+        nonlocal interrupted
+        interrupted = True
+        if proc is not None and proc.poll() is None:
+            proc.send_signal(signum)
+
+    previous = {s: signal.signal(s, on_signal) for s in (signal.SIGTERM, signal.SIGINT)}
+    stage = None
+    lock_busy = False
+    try:
+        proc = subprocess.Popen(cmd, cwd=src, env=env, stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, text=True)
+        for line in proc.stdout:
+            sys.stdout.write(line)
+            sys.stdout.flush()
+            m = STAGE_LINE.fullmatch(line.rstrip("\n"))
+            if m:
+                stage = m.group(1)
+            if "holds" in line and ".lock" in line:
+                lock_busy = True
+        rc = proc.wait()
+    finally:
+        for s, handler in previous.items():
+            signal.signal(s, handler)
+    shutil.rmtree(src, ignore_errors=True)
+    if interrupted:
+        print("nightly: interrupted; poll reconciles from sacct", flush=True)
+        return 143
+    if rc == 0:
+        finish(state, key, "success", None)
+    else:
+        finish(state, key, "failed", "cache lock" if lock_busy else stage)
+    return rc
+
+
+def prune(state, site):
+    """Delete image files of successful nightlies past the newest NIGHTLY_KEEP.
+
+    A file that a -latest link points at stays. Manifests, records and
+    logs always stay.
+    """
+    keep = int(site["NIGHTLY_KEEP"])
+    done = sorted((r for r in load_records(state) if r["status"] == "success"),
+                  key=lambda r: r.get("finished_at") or "", reverse=True)
+    for rec in done[keep:]:
+        d = Path(rec["images_dir"])
+        if not d.is_dir():
+            continue
+        latest = {os.path.realpath(p) for p in d.glob("*-latest.*") if p.is_symlink()}
+        for suffix in ("oci.tar", "sif"):
+            for path in sorted(d.glob(f"t1-*-{rec['variant']}-{rec['tag']}.{suffix}")):
+                if path.is_symlink() or os.path.realpath(path) in latest:
+                    continue
+                os.remove(path)
+                log(state, f"pruned {path}")
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(prog="nightly.py", description=__doc__.split("\n\n")[0])
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -547,6 +670,8 @@ def main(argv=None):
     p = add("retry", "submit a new attempt of a failed, interrupted or cancelled build")
     p.add_argument("key")
     add("status", "one line per build, newest first")
+    p = add("run", "build one record (runs inside the Slurm job)")
+    p.add_argument("key")
 
     args = parser.parse_args(argv)
     state_arg = args.state or os.environ.get("T1_NIGHTLY_STATE")
@@ -561,6 +686,8 @@ def main(argv=None):
             return review(state, args.key, args.note)
         if args.cmd == "retry":
             return retry(state, args.key)
+        if args.cmd == "run":
+            return run(state, args.key)
         if args.cmd == "status":
             return status(state)
     except UsageError as e:
