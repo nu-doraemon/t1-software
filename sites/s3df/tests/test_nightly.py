@@ -255,6 +255,16 @@ class NightlyTest(unittest.TestCase):
         self.assertEqual(newest["changed"], {"PKG_COMMIT": [f.A, B]})
         self.assertEqual(newest["pins"], {"PKG_COMMIT": B})
 
+    def test_record_order_tiebreak(self):
+        f = self.fixture()
+        for key, job in [("aaaaaaaaaaaa", "120"), ("bbbbbbbbbbbb", "9"), ("cccccccccccc", "300")]:
+            d = nightly.build_dir(f.state, key)
+            d.mkdir(parents=True)
+            (d / "record.json").write_text(json.dumps(
+                {"key": key, "queued_at": "2026-11-09T10:00:00Z", "slurm_job_ids": [job]}))
+        self.assertEqual([r["key"] for r in f.records()],
+                         ["cccccccccccc", "aaaaaaaaaaaa", "bbbbbbbbbbbb"])
+
     def test_variant_change_builds(self):
         f = self.fixture()
         f.poll()

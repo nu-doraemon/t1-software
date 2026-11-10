@@ -187,14 +187,25 @@ def record_path(state, key):
     return build_dir(state, key) / "record.json"
 
 
+def _order(record):
+    """Sort key: queued_at, then the last Slurm job id.
+
+    queued_at has one-second resolution, so two records can tie. Slurm job
+    ids grow monotonically, which breaks the tie.
+    """
+    ids = record.get("slurm_job_ids") or []
+    last = int(ids[-1]) if ids and str(ids[-1]).isdigit() else -1
+    return (record.get("queued_at") or "", last)
+
+
 def load_records(state):
-    """All records, newest queued_at first."""
+    """All records, newest first (see _order)."""
     records = []
     for path in (state / "builds").glob("*/record.json"):
         rec = load_json(path)
         if rec is not None:
             records.append(rec)
-    records.sort(key=lambda r: r.get("queued_at") or "", reverse=True)
+    records.sort(key=_order, reverse=True)
     return records
 
 
