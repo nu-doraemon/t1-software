@@ -235,7 +235,7 @@ class NightlyTest(unittest.TestCase):
         self.assertEqual(set(rec), {
             "key", "variant", "t1_software_commit", "pins", "changed", "status",
             "failed_stage", "attempts", "slurm_job_ids", "queued_at", "started_at",
-            "finished_at", "tag", "images_dir"})
+            "finished_at", "tag", "images_dir", "repos"})
         self.assertEqual(rec["status"], "queued")
         self.assertEqual(rec["attempts"], 1)
         self.assertEqual(rec["slurm_job_ids"], ["101"])
@@ -243,6 +243,8 @@ class NightlyTest(unittest.TestCase):
         self.assertEqual(rec["tag"], f"{utc_today()}-{rec['key']}")
         self.assertEqual(rec["changed"], {"T1_SOFTWARE_COMMIT": [None, f.t1_commit],
                                           "PKG_COMMIT": [None, f.A]})
+        self.assertEqual(rec["repos"], {"T1_SOFTWARE_COMMIT": f"file://{f.t1_git}",
+                                        "PKG_COMMIT": f"file://{f.pkg_git}"})
         self.assertTrue((nightly.build_dir(f.state, rec["key"]) / "build.log").exists())
         f.set_status(rec["key"], "success")
         self.assertEqual(f.poll(), 0)
@@ -454,6 +456,30 @@ class NightlyTest(unittest.TestCase):
         self.assertIn("== stage-two ==", out)
         self.assertFalse((f.root / "work" / "t1-nightly" / f"{rec['key']}-src").exists())
 
+    def test_run_updates_nightly_link(self):
+        f, rec = self.polled()
+        img = f.root / "img"
+        link = img / "t1-lartpc-cuda12-nightly.sif"
+        (img / "nightly").mkdir(parents=True)
+        sif = img / "nightly" / f"t1-lartpc-cuda12-{rec['tag']}.sif"
+        # The fake build.sh writes no image: no image, no link.
+        f.main("run", rec["key"])
+        self.assertFalse(os.path.lexists(link))
+        sif.write_text("x")
+        old = img / "nightly" / "t1-lartpc-cuda12-19700101-old.sif"
+        old.write_text("y")
+        link.symlink_to(f"nightly/{old.name}")
+        f.set_status(rec["key"], "queued")
+        f.main("run", rec["key"])
+        self.assertEqual(os.readlink(link), f"nightly/{sif.name}")
+        # A failed build leaves the link alone.
+        link.unlink()
+        link.symlink_to(f"nightly/{old.name}")
+        os.environ["FAKE_BUILD_RC"] = "1"
+        f.set_status(rec["key"], "queued")
+        f.main("run", rec["key"])
+        self.assertEqual(os.readlink(link), f"nightly/{old.name}")
+
     def test_run_failure_stage(self):
         f, rec = self.polled()
         os.environ["FAKE_BUILD_RC"] = "1"
@@ -553,26 +579,33 @@ class NightlyTest(unittest.TestCase):
     # -- dashboard ---------------------------------------------------------
 
     def dashboard_fixture(self, poll_age_hours=49, ok=True, error=None):
-        """Four hand-made records and a last-poll.json poll_age_hours old."""
+        """Five hand-made records and a last-poll.json poll_age_hours old."""
         f = self.fixture()
         img = f.root / "img" / "nightly"
         img.mkdir(parents=True)
         keys = {}
         for i, (name, status, attempts) in enumerate([
                 ("ok", "success", 1), ("rev", "failed", 1), ("bad", "failed", 1),
-                ("int", "interrupted", 2)]):
+                ("int", "interrupted", 2), ("gone", "success", 1)]):
             key = f"{name:0<12}"[:12]
             keys[name] = key
             tag = f"20261101-{key}"
             d = nightly.build_dir(f.state, key)
             d.mkdir(parents=True)
-            nightly.write_json(d / "record.json", {
+            rec = {
                 "key": key, "variant": "cuda12", "t1_software_commit": "a" * 40,
-                "pins": {"PKG_COMMIT": "b" * 40}, "changed": {"PKG_COMMIT": [None, "b" * 40]},
+                "pins": {"PKG_COMMIT": "b" * 40}, "changed": {"PKG_COMMIT": ["c" * 40, "b" * 40]},
+                "repos": {"T1_SOFTWARE_COMMIT": "https://github.com/o/t1-software.git",
+                          "PKG_COMMIT": "https://github.com/o/pkg"},
                 "status": status, "failed_stage": "stage-two" if status == "failed" else None,
                 "attempts": attempts, "slurm_job_ids": [str(100 + i)],
                 "queued_at": f"2026-11-0{i + 1}T00:00:00Z", "started_at": None,
-                "finished_at": None, "tag": tag, "images_dir": str(img)})
+                "finished_at": None, "tag": tag, "images_dir": str(img)}
+            if name == "ok":
+                rec.update(started_at="2026-11-01T00:10:00Z", finished_at="2026-11-01T00:44:59Z")
+            if name == "int":
+                del rec["repos"]  # a record from before repos were stored
+            nightly.write_json(d / "record.json", rec)
             (d / "build.log").write_text("== stage-one ==\n<b>log</b>\n")
             if name == "ok":
                 (img / f"t1-lartpc-cuda12-{tag}.sif").write_text("x")
@@ -586,29 +619,65 @@ class NightlyTest(unittest.TestCase):
         return f, keys
 
     def index_row(self, index_html, key):
-        row = [line for line in index_html.splitlines() if f"builds/{key}.html" in line]
+        row = [line for line in index_html.splitlines()
+               if line.startswith("<tr") and f"builds/{key}.html" in line]
         self.assertEqual(len(row), 1)
         return row[0]
 
     def test_render_pages(self):
         f, keys = self.dashboard_fixture()
+        ok = nightly.load_json(nightly.record_path(f.state, keys["ok"]))
+        self.assertTrue(nightly.update_nightly_link(nightly.load_site(f.state), ok))
         out = f.root / "out"
         rc, _, err = f.main("render", "--out", str(out))
         self.assertEqual(rc, 0, err)
         index = (out / "index.html").read_text()
         for key in keys.values():
             self.assertTrue((out / "builds" / f"{key}.html").exists())
+        self.assertIn("<title>T1-LArTPC nightly builds</title>", index)
         self.assertIn("Poller stale", index)
         self.assertIn("reviewed", self.index_row(index, keys["rev"]))
         self.assertIn("needs review", self.index_row(index, keys["bad"]))
-        self.assertIn("yes", self.index_row(index, keys["ok"]))
+        self.assertNotIn("pruned", self.index_row(index, keys["ok"]))
+        self.assertIn("pruned", self.index_row(index, keys["gone"]))
+        self.assertIn("2026-11-01 00:00Z", self.index_row(index, keys["ok"]))
+        self.assertIn("t1-lartpc-cuda12-nightly.sif", index)
+        self.assertIn(f"&rarr; <code>nightly/t1-lartpc-cuda12-20261101-{keys['ok']}.sif</code>", index)
+        self.assertIn("5 builds: 2 succeeded, 2 failed, 1 need review", index)
         pages = [out / "index.html", *(out / "builds").glob("*.html")]
         for page in pages:
             text = page.read_text()
-            self.assertNotRegex(text, r"<script|\son\w+=|href=\"/|href=\"[a-z]+:")
             self.assertNotIn("<b>log</b>", text)  # log text is escaped
+            # One inline script (the theme toggle); no handlers, no absolute paths.
+            self.assertEqual(text.count("<script"), 1)
+            bare = re.sub(r"<script>.*?</script>", "", text, flags=re.S)
+            self.assertNotRegex(bare, r"<script|\son\w+=|href=\"/")
             for href in re.findall(r'href="([^"]+)"', text):
-                self.assertTrue((page.parent / href).exists(), f"{page}: {href}")
+                if href.startswith("https://"):
+                    self.assertRegex(href, r"^https://github\.com/o/(t1-software|pkg)/commit/[0-9a-f]{40}$")
+                else:
+                    self.assertTrue((page.parent / href).exists(), f"{page}: {href}")
+
+    def test_commit_links_and_duration(self):
+        f, keys = self.dashboard_fixture()
+        out = f.root / "out"
+        f.main("render", "--out", str(out))
+        page = (out / "builds" / f"{keys['ok']}.html").read_text()
+        self.assertIn(f'href="https://github.com/o/pkg/commit/{"b" * 40}"', page)
+        self.assertIn(f'href="https://github.com/o/pkg/commit/{"c" * 40}"', page)  # was
+        self.assertIn(f'href="https://github.com/o/t1-software/commit/{"a" * 40}"', page)
+        self.assertIn("0 h 34 min", page)
+        # The log is not published: its location and tail are shown, no copy is made.
+        self.assertIn(str(nightly.build_dir(f.state, keys["ok"]) / "build.log"), page)
+        self.assertIn("== stage-one ==", page)
+        self.assertEqual([p.name for p in (out / "builds").iterdir() if not p.name.endswith(".html")], [])
+        index = (out / "index.html").read_text()
+        self.assertIn(f'href="https://github.com/o/t1-software/commit/{"a" * 40}"',
+                      self.index_row(index, keys["ok"]))
+        # A record without stored repos shows plain commits.
+        old = (out / "builds" / f"{keys['int']}.html").read_text()
+        self.assertNotIn("https://", old)
+        self.assertIn("bbbbbbbb", old)
 
     def test_no_banner_when_fresh(self):
         f, _ = self.dashboard_fixture(poll_age_hours=1)

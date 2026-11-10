@@ -1,35 +1,81 @@
 """Static HTML dashboard of the nightly build ledger.
 
 render() writes index.html and one page per build into an output
-directory. The pages use no JavaScript and only relative links, so they
-open straight from the filesystem or from any static web server. Build
-logs are copied next to the pages for the same reason.
+directory. The pages work without JavaScript. One small inline script
+adds a light/dark toggle and remembers the choice; without it the pages
+follow the system theme. All links are relative except the commit links
+to github.com. Build logs are not published: a build page shows the log
+file location and the last lines of build.log.
 
 This module reads nothing from the ledger itself: nightly.py gathers the
 inputs under the ledger lock and passes them in.
 """
 import html
 import os
-import shutil
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 
 LOG_TAIL = 200  # lines of build.log shown on a build page
+INDEX_TITLE = "T1-LArTPC nightly builds"
+T1 = "T1_SOFTWARE_COMMIT"
+REVIEW_SECTION = ("failed", "interrupted", "cancelled")
 
-STYLE = """
-body { font-family: sans-serif; margin: 1.5em; color: #222; }
-table { border-collapse: collapse; margin: 0.5em 0 1.5em; }
-th, td { border: 1px solid #ccc; padding: 0.2em 0.6em; text-align: left; vertical-align: top; }
-th { background: #f0f0f0; }
-code, pre { font-family: monospace; }
-pre { background: #f7f7f7; border: 1px solid #ddd; padding: 0.6em; overflow-x: auto; }
-.banner { padding: 0.6em; margin: 0.6em 0; border: 1px solid; font-weight: bold; }
-.stale { background: #fff3cd; border-color: #c9a300; }
-.error { background: #f8d7da; border-color: #b02a37; }
-.success { color: #146c43; }
-.failed, .cancelled, .interrupted { color: #b02a37; }
-.queued, .running { color: #0a58ca; }
+_LIGHT = ("--bg:#fafaf7;--fg:#222;--muted:#777;--line:#dcdcd4;--head:#efefe8;--link:#005cc5;"
+          "--ok:#22863a;--bad:#d73a49;--run:#005cc5;--warn:#b08800;--warnbg:#fff5b1;"
+          "--code:#efefe8;--row:#f3f3ec")
+_DARK = ("--bg:#14161a;--fg:#d4d7dd;--muted:#80868f;--line:#2a2e35;--head:#1c1f25;--link:#79b8ff;"
+         "--ok:#56d364;--bad:#ff7b72;--run:#79b8ff;--warn:#e3b341;--warnbg:#3a2f0b;"
+         "--code:#1c1f25;--row:#1a1d22")
+
+STYLE = (
+    f":root{{color-scheme:light;{_LIGHT}}}"
+    f"@media(prefers-color-scheme:dark){{:root:not([data-theme=light]){{color-scheme:dark;{_DARK}}}}}"
+    f":root[data-theme=dark]{{color-scheme:dark;{_DARK}}}"
+    """
+*{box-sizing:border-box}
+[hidden]{display:none!important}
+body{margin:0;background:var(--bg);color:var(--fg);font:13.5px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif}
+a{color:var(--link);text-decoration:none}a:hover{text-decoration:underline}
+code,pre,table{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+code{background:var(--code);padding:.05em .35em;border-radius:4px;font-size:.92em}
+pre{background:var(--code);border:1px solid var(--line);border-radius:6px;padding:.8em;overflow-x:auto;font-size:.82em;line-height:1.45}
+.wrap{max-width:1240px;margin:0 auto;padding:0 20px 40px}
+header.top{border-bottom:1px solid var(--line)}
+header.top .wrap{display:flex;align-items:center;gap:16px;padding-top:14px;padding-bottom:14px}
+header.top h1{margin:0;font-size:1.05rem;flex:1;font-family:ui-monospace,Menlo,Consolas,monospace}
+.toggle{cursor:pointer;border:1px solid var(--line);border-radius:999px;padding:3px 12px;background:var(--bg);color:var(--fg);font:inherit;font-size:.85rem}
+.toggle:hover{border-color:var(--muted)}
+.ok{color:var(--ok)}.bad{color:var(--bad)}.run{color:var(--run)}.muted{color:var(--muted)}
+table{border-collapse:collapse;width:100%;font-size:.9rem}
+th{text-align:left;font-weight:600;color:var(--muted);font-size:.8rem;text-transform:uppercase;letter-spacing:.03em}
+th,td{padding:3px 8px;border-bottom:1px solid var(--line);vertical-align:top}
+tbody tr:hover td{background:var(--row)}
+tr.pruned td{color:var(--muted)}
+time,th,.nowrap{white-space:nowrap}
+.scroll{overflow-x:auto}
+.banner{border:1px solid var(--warn);background:var(--warnbg);color:var(--warn);padding:8px 12px;border-radius:6px;margin:12px 0;font-weight:600}
+.banner.error{border-color:var(--bad);color:var(--bad)}
+.meta{color:var(--muted);margin:14px 0}
+.dot{display:inline-block;width:.7em;height:.7em;border-radius:50%;background:currentColor;margin-right:.45em}
+.crumb{margin:16px 0 4px}
+h2{font-size:1.05rem;margin:28px 0 8px}
+dl.kv{display:grid;grid-template-columns:max-content 1fr;gap:6px 22px;margin:8px 0}
+dl.kv dt{color:var(--muted)}dl.kv dd{margin:0;overflow-wrap:anywhere}
 """
+)
+
+THEME_SCRIPT = (
+    '<script>(function(){var r=document.documentElement,k="t1-theme";'
+    'try{var s=localStorage.getItem(k);if(s==="dark"||s==="light")r.dataset.theme=s}catch(e){}'
+    'addEventListener("DOMContentLoaded",function(){var b=document.getElementById("theme-toggle");'
+    'b.hidden=false;b.onclick=function(){var d=r.dataset.theme||'
+    '(matchMedia("(prefers-color-scheme: dark)").matches?"dark":"light");'
+    'd=d==="dark"?"light":"dark";r.dataset.theme=d;'
+    'try{localStorage.setItem(k,d)}catch(e){}}})})();</script>'
+)
+
+GITHUB = re.compile(r"https://github\.com/([\w.-]+)/([\w.-]+?)(?:\.git)?/?")
 
 
 def esc(value):
@@ -44,22 +90,52 @@ def parse_time(text):
     return datetime.strptime(text, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
 
 
+def stamp(text):
+    """A UTC time to the minute; the full ISO time is in the tooltip."""
+    if not text:
+        return "-"
+    return f"<time datetime=\"{esc(text)}\" title=\"{esc(text)}\">{esc(text[:10])} {esc(text[11:16])}Z</time>"
+
+
 def write_atomic(path, text):
     tmp = path.with_name(f".{path.name}.tmp.{os.getpid()}")
     tmp.write_text(text)
     os.replace(tmp, path)
 
 
-def page(title, body):
-    return (f"<!DOCTYPE html>\n<html><head><meta charset=\"utf-8\">"
-            f"<title>{esc(title)}</title><style>{STYLE}</style></head>\n"
-            f"<body>\n{body}\n</body></html>\n")
+def page(title, heading, body):
+    return (f"<!DOCTYPE html>\n<html lang=\"en\"><head><meta charset=\"utf-8\">"
+            f"<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+            f"<title>{esc(title)}</title><style>{STYLE}</style>{THEME_SCRIPT}</head>\n"
+            f"<body>\n<header class=\"top\"><div class=\"wrap\"><h1>{heading}</h1>"
+            f"<button id=\"theme-toggle\" class=\"toggle\" type=\"button\" hidden "
+            f"title=\"Toggle light/dark\">&#9680; theme</button></div></header>\n"
+            f"<div class=\"wrap\">\n{body}\n</div>\n</body></html>\n")
 
 
 def table(headers, rows):
+    """rows: (css class, [cell html, ...]); one table row per output line."""
     head = "".join(f"<th>{esc(h)}</th>" for h in headers)
-    body = "".join("<tr>" + "".join(f"<td>{c}</td>" for c in row) + "</tr>\n" for row in rows)
-    return f"<table><tr>{head}</tr>\n{body}</table>"
+    body = "".join(
+        ("<tr class=\"" + cls + "\">" if cls else "<tr>")
+        + "".join(f"<td>{c}</td>" for c in cells) + "</tr>\n"
+        for cls, cells in rows)
+    return f"<div class=\"scroll\"><table><thead><tr>{head}</tr></thead>\n<tbody>\n{body}</tbody></table></div>"
+
+
+def commit_link(record, key, sha):
+    """The short commit, linked to its GitHub page when the clone URL is on github.com."""
+    if not sha:
+        return "-"
+    text = f"<code>{short(sha)}</code>"
+    m = GITHUB.fullmatch((record.get("repos") or {}).get(key) or "")
+    if not m:
+        return text
+    return f"<a href=\"https://github.com/{esc(m.group(1))}/{esc(m.group(2))}/commit/{esc(sha)}\">{text}</a>"
+
+
+def pkg_name(key):
+    return key.removesuffix("_COMMIT").lower().replace("_", "-")
 
 
 def log_names(src_dir):
@@ -72,24 +148,17 @@ def log_names(src_dir):
     return names
 
 
-def copy_logs(src_dir, dst_dir):
-    """Copy logs that are missing or older than the source. Returns their names."""
-    names = log_names(src_dir)
-    if names:
-        dst_dir.mkdir(parents=True, exist_ok=True)
-    for name in names:
-        src, dst = src_dir / name, dst_dir / name
-        if not dst.exists() or dst.stat().st_mtime < src.stat().st_mtime:
-            shutil.copy2(src, dst)
-    return names
-
-
-def images_state(record):
+def image_file(record):
     d = Path(record["images_dir"])
-    stem = f"t1-lartpc-{record['variant']}-{record['tag']}"
-    if (d / f"{stem}.sif").exists() or (d / f"{stem}.oci.tar").exists():
-        return "yes"
-    return "pruned" if record["status"] == "success" else "-"
+    return d / f"t1-lartpc-{record['variant']}-{record['tag']}.sif"
+
+
+def is_pruned(record):
+    """A successful build whose image files retention has deleted."""
+    if record["status"] != "success":
+        return False
+    sif = image_file(record)
+    return not (sif.exists() or sif.with_suffix(".oci.tar").exists())
 
 
 def banners(site, last_poll, now):
@@ -106,79 +175,152 @@ def banners(site, last_poll, now):
     return out
 
 
-def render_index(out, site, records, review_states, last_poll, now):
-    parts = ["<h1>T1 nightly builds</h1>"]
+def is_initial(record):
+    """The first poll of a ledger: every package is new."""
+    changed = record.get("changed") or {}
+    return bool(changed) and all(old is None for old, _ in changed.values())
+
+
+def changed_cell(record):
+    changed = record.get("changed") or {}
+    if not changed:
+        return "-"
+    if is_initial(record):
+        return "<span class=\"muted\">initial</span>"
+    names = [pkg_name(k) for k in sorted(changed)]
+    text = ", ".join(names[:2]) + (f" +{len(names) - 2}" if len(names) > 2 else "")
+    return f"<span title=\"{esc(', '.join(names))}\">{esc(text)}</span>"
+
+
+def status_html(record):
+    cls = {"success": "ok", "running": "run", "queued": "run"}.get(record["status"], "bad")
+    return f"<span class=\"{cls}\"><span class=\"dot\"></span>{esc(record['status'])}</span>"
+
+
+def review_html(review_state):
+    cls = "bad" if review_state == "needs review" else "muted"
+    return f"<span class=\"{cls}\">{esc(review_state)}</span>"
+
+
+def nightly_line(link, records):
+    """The nightly symlink and the build it points at; "" when there is no link."""
+    if link is None or not os.path.islink(link):
+        return ""
+    target = os.readlink(link)
+    name = os.path.basename(target)
+    build = next((r for r in records if name == image_file(r).name), None)
+    of = (f" (build <a href=\"builds/{esc(build['key'])}.html\"><code>{esc(build['key'])}</code></a>)"
+          if build else "")
+    return (f"Nightly image: <code>{esc(link)}</code> &rarr; <code>{esc(target)}</code>{of}<br>")
+
+
+def render_index(out, site, records, review_states, last_poll, nightly_link, now):
+    parts = []
     for cls, text in banners(site, last_poll, now):
         parts.append(f"<div class=\"banner {cls}\">{esc(text)}</div>")
+    n_ok = sum(r["status"] == "success" for r in records)
+    n_bad = sum(r["status"] == "failed" for r in records)
+    n_rev = sum(review_states.get(r["key"]) == "needs review" for r in records)
+    meta = [f"{len(records)} build{'' if len(records) == 1 else 's'}: "
+            f"{n_ok} succeeded, {n_bad} failed, {n_rev} need review"]
     if last_poll is not None:
         state = "ok" if last_poll.get("ok") else f"error: {last_poll.get('error')}"
-        parts.append(f"<p>Last poll: {esc(last_poll['time'])} ({esc(state)}). "
-                     f"Rendered: {esc(now.strftime('%Y-%m-%dT%H:%M:%SZ'))}.</p>")
+        meta.append(f"Last poll {esc(last_poll['time'])} ({esc(state)}). "
+                    f"Rendered {esc(now.strftime('%Y-%m-%dT%H:%M:%SZ'))}.")
+    parts.append(f"<p class=\"meta\">{nightly_line(nightly_link, records)}{'<br>'.join(meta)}</p>")
     rows = []
     for rec in records:
         key = rec["key"]
-        rows.append([
-            esc((rec.get("queued_at") or "")[:10]),
+        pruned = is_pruned(rec)
+        status = status_html(rec) + (
+            " <span class=\"muted\" title=\"Image files removed by retention (NIGHTLY_KEEP)\">pruned</span>"
+            if pruned else "")
+        rows.append(("pruned" if pruned else "", [
+            stamp(rec.get("queued_at")),
             f"<a href=\"builds/{esc(key)}.html\"><code>{esc(key)}</code></a>",
-            f"<span class=\"{esc(rec['status'])}\">{esc(rec['status'])}</span>",
-            esc(review_states.get(key, "")),
+            status,
+            review_html(review_states.get(key, "")),
             esc(rec.get("failed_stage") or ""),
             esc(rec["attempts"]),
-            f"<code>{short(rec['t1_software_commit'])}</code>",
-            esc(", ".join(rec.get("changed") or {})),
-            esc(images_state(rec)),
-        ])
-    parts.append(table(["date", "key", "status", "review", "failed stage", "attempts",
-                        "t1-software", "changed", "images"], rows))
-    write_atomic(out / "index.html", page("T1 nightly builds", "\n".join(parts)))
+            commit_link(rec, T1, rec["t1_software_commit"]),
+            changed_cell(rec),
+        ]))
+    parts.append(table(["queued (UTC)", "build", "status", "review", "failed stage", "tries",
+                        "t1-software", "changed"], rows))
+    write_atomic(out / "index.html", page(INDEX_TITLE, esc(INDEX_TITLE), "\n".join(parts)))
+
+
+def duration(record):
+    if not (record.get("started_at") and record.get("finished_at")):
+        return "-"
+    minutes = int((parse_time(record["finished_at"]) - parse_time(record["started_at"])).total_seconds() // 60)
+    return f"{minutes // 60} h {minutes % 60:02d} min"
 
 
 def render_build(out, record, review, review_state, src_dir):
     key = record["key"]
-    logs = copy_logs(src_dir, out / "builds" / key)
-    parts = ["<p><a href=\"../index.html\">all builds</a></p>",
-             f"<h1>Build <code>{esc(key)}</code></h1>"]
-    fields = []
-    for name in sorted(record):
-        if name in ("pins", "changed"):
-            continue
-        value = record[name]
-        if isinstance(value, list):
-            value = ", ".join(str(v) for v in value)
-        fields.append([esc(name), esc(value)])
-    fields.append([esc("review state"), esc(review_state)])
-    parts.append(table(["field", "value"], fields))
-    parts.append("<h2>Pins</h2>")
-    parts.append(table(["key", "commit"], [[esc(k), f"<code>{esc(v)}</code>"]
-                                           for k, v in sorted(record["pins"].items())]))
-    parts.append("<h2>Changed since the previous poll</h2>")
-    parts.append(table(["name", "old", "new"], [
-        [esc(n), f"<code>{short(old)}</code>", f"<code>{short(new)}</code>"]
-        for n, (old, new) in sorted((record.get("changed") or {}).items())]))
-    parts.append("<h2>Review</h2>")
-    if review is None:
-        parts.append("<p>No review.</p>")
+    logs = log_names(src_dir)
+    changed = record.get("changed") or {}
+    t1_old = (changed.get(T1) or [None])[0]
+    t1_cell = commit_link(record, T1, record["t1_software_commit"])
+    if t1_old:
+        t1_cell += f" <span class=\"muted\">was {commit_link(record, T1, t1_old)}</span>"
+    if record["status"] != "success":
+        image = "-"
+    elif is_pruned(record):
+        image = "<span class=\"muted\">pruned (removed by retention)</span>"
     else:
-        parts.append(table(["time", "user", "attempt", "note"], [[
-            esc(review.get("time")), esc(review.get("user")), esc(review.get("attempt")),
-            esc(review.get("note"))]]))
+        image = f"<code>{esc(image_file(record))}</code>"
+    fields = [("Status", status_html(record)), ("Review", esc(review_state) or "-"),
+              ("Queued", stamp(record.get("queued_at"))), ("Started", stamp(record.get("started_at"))),
+              ("Finished", stamp(record.get("finished_at"))), ("Duration", duration(record)),
+              ("Attempts", esc(record["attempts"])),
+              ("Slurm jobs", esc(", ".join(record.get("slurm_job_ids") or [])) or "-"),
+              ("Variant", esc(record["variant"])), ("Tag", f"<code>{esc(record['tag'])}</code>"),
+              ("t1-software", t1_cell), ("Image", image)]
+    if record.get("failed_stage"):
+        fields.insert(1, ("Failed stage", esc(record["failed_stage"])))
+    parts = ["<p class=\"crumb\"><a href=\"../index.html\">&larr; all builds</a></p>",
+             "<dl class=\"kv\">" + "".join(f"<dt>{k}</dt><dd>{v}</dd>" for k, v in fields) + "</dl>",
+             "<h2>Packages</h2>"]
+    rows = []
+    for name, sha in sorted(record["pins"].items()):
+        if name not in changed:
+            note = "<span class=\"muted\">unchanged</span>"
+        elif changed[name][0] is None:
+            note = "<span class=\"muted\">first build</span>"
+        else:
+            note = f"was {commit_link(record, name, changed[name][0])}"
+        rows.append(("", [esc(pkg_name(name)), commit_link(record, name, sha), note]))
+    parts.append(table(["package", "pinned commit", "since previous poll"], rows))
+    if review is not None or record["status"] in REVIEW_SECTION:
+        parts.append("<h2>Review</h2>")
+        if review is None:
+            parts.append("<p class=\"muted\">No review.</p>")
+        else:
+            parts.append(
+                f"<dl class=\"kv\"><dt>Reviewed</dt><dd>{stamp(review.get('time'))} by "
+                f"{esc(review.get('user'))} (attempt {esc(review.get('attempt'))})</dd>"
+                f"<dt>Note</dt><dd>{esc(review.get('note'))}</dd></dl>")
     parts.append("<h2>Logs</h2>")
     if logs:
         parts.append("<ul>" + "".join(
-            f"<li><a href=\"{esc(key)}/{esc(n)}\">{esc(n)}</a></li>" for n in logs) + "</ul>")
+            f"<li><code>{esc(src_dir / n)}</code></li>" for n in logs) + "</ul>")
         if "build.log" in logs:
             lines = (src_dir / "build.log").read_text(errors="replace").splitlines()
-            parts.append(f"<p>Last {LOG_TAIL} lines of build.log:</p>")
+            parts.append(f"<p class=\"meta\">Last {LOG_TAIL} lines of build.log</p>")
             parts.append("<pre>" + esc("\n".join(lines[-LOG_TAIL:])) + "</pre>")
     else:
-        parts.append("<p>No log yet.</p>")
-    write_atomic(out / "builds" / f"{key}.html", page(f"T1 nightly build {key}", "\n".join(parts)))
+        parts.append("<p class=\"muted\">No log yet.</p>")
+    write_atomic(out / "builds" / f"{key}.html",
+                 page(f"{INDEX_TITLE}: build {key}", f"Build <code>{esc(key)}</code>", "\n".join(parts)))
 
 
-def render(out, *, site, records, reviews, review_states, last_poll, build_dirs, now):
+def render(out, *, site, records, reviews, review_states, last_poll, build_dirs,
+           nightly_link=None, now):
     out = Path(out)
     (out / "builds").mkdir(parents=True, exist_ok=True)
-    render_index(out, site, records, review_states, last_poll, now)
+    render_index(out, site, records, review_states, last_poll, nightly_link, now)
     for rec in records:
         key = rec["key"]
         render_build(out, rec, reviews.get(key), review_states.get(key, ""), build_dirs[key])

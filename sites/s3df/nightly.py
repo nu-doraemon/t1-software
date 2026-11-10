@@ -254,7 +254,9 @@ def ls_remote(repo, ref):
 
 
 def resolve_heads(state, site):
-    """HEADs of t1-software and of every package with a <PKG>_REPO key."""
+    """HEADs and clone URLs of t1-software and of every package with a
+    <PKG>_REPO key. Returns (heads, repos), both keyed by <PKG>_COMMIT.
+    """
     repo, branch = site["T1_SOFTWARE_REPO"], site["T1_SOFTWARE_BRANCH"]
     commit = ls_remote(repo, f"refs/heads/{branch}")
     cache = state / "t1-software.git"
@@ -265,6 +267,7 @@ def resolve_heads(state, site):
     for line in git("-C", str(cache), "ls-tree", "--name-only", commit, "subgroups/").splitlines():
         paths.append(f"{line}/versions.env")
     heads = {T1: commit}
+    repos = {T1: repo}
     for path in paths:
         try:
             text = git("-C", str(cache), "show", f"{commit}:{path}")
@@ -275,8 +278,35 @@ def resolve_heads(state, site):
         pins = parse_kv(text)
         for key in sorted(pins):
             if key.endswith("_COMMIT") and pins.get(key[: -len("_COMMIT")] + "_REPO"):
-                heads[key] = ls_remote(pins[key[: -len("_COMMIT")] + "_REPO"], "HEAD")
-    return heads
+                url = pins[key[: -len("_COMMIT")] + "_REPO"]
+                heads[key] = ls_remote(url, "HEAD")
+                repos[key] = url
+    return heads, repos
+
+
+def nightly_link(site, variant):
+    """Path of the symlink to the newest nightly .sif of a variant, next to nightly/."""
+    return Path(site["IMAGES_DIR"]) / f"t1-lartpc-{variant}-nightly.sif"
+
+
+def update_nightly_link(site, rec):
+    """Point nightly_link at rec's .sif with a relative target. Returns
+    False when the image file is missing or the link cannot be written.
+    """
+    sif = Path(rec["images_dir"]) / f"t1-lartpc-{rec['variant']}-{rec['tag']}.sif"
+    link = nightly_link(site, rec["variant"])
+    if not sif.is_file():
+        return False
+    tmp = link.with_name(f".{link.name}.tmp.{os.getpid()}")
+    try:
+        tmp.unlink(missing_ok=True)
+        tmp.symlink_to(os.path.relpath(sif, link.parent))
+        os.replace(tmp, link)
+    except OSError as e:
+        print(f"nightly: cannot update {link}: {e}", file=sys.stderr, flush=True)
+        tmp.unlink(missing_ok=True)
+        return False
+    return True
 
 
 def sacct_state(site, job_id):
@@ -350,7 +380,7 @@ def resubmit(state, site, record):
     return job_id
 
 
-def new_record(site, key, heads, changed):
+def new_record(site, key, heads, repos, changed):
     queued_at = now_iso()
     return {
         "key": key,
@@ -358,6 +388,7 @@ def new_record(site, key, heads, changed):
         "t1_software_commit": heads[T1],
         "pins": {k: v for k, v in heads.items() if k != T1},
         "changed": changed,
+        "repos": repos,
         "status": "queued",
         "failed_stage": None,
         "attempts": 1,
@@ -408,7 +439,7 @@ def _poll(state, site, dry_run):
     active = [r for r in records if r["status"] in ACTIVE]
 
     try:
-        heads = resolve_heads(state, site)
+        heads, repos = resolve_heads(state, site)
     except PollError as e:
         if not dry_run:
             write_json(state / "last-poll.json",
@@ -458,7 +489,7 @@ def _poll(state, site, dry_run):
         if dry_run:
             log(state, f"would submit {key} changed {','.join(changed)}", dry_run=True)
             return 0
-        rec = new_record(site, key, heads, changed)
+        rec = new_record(site, key, heads, repos, changed)
         d = build_dir(state, key)
         d.mkdir(parents=True, exist_ok=True)
         save_record(state, rec)
@@ -494,6 +525,7 @@ def refresh(state, site, out=None):
                 review_states={r["key"]: review_state(r, reviews[r["key"]]) for r in records},
                 last_poll=load_json(state / "last-poll.json"),
                 build_dirs={r["key"]: build_dir(state, r["key"]) for r in records},
+                nightly_link=nightly_link(site, site["VARIANT"]),
                 now=datetime.now(timezone.utc))
     except Exception as e:  # the dashboard must never break a poll or a build
         print(f"render failed: {e}", file=sys.stderr, flush=True)
@@ -671,6 +703,7 @@ def _run(state, site, key):
         return 143
     if rc == 0:
         finish(state, key, "success", None)
+        update_nightly_link(site, rec)
     else:
         finish(state, key, "failed", "cache lock" if lock_busy else stage)
     return rc

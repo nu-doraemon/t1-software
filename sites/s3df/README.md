@@ -97,6 +97,13 @@ it gives a new key and builds on the next poll.
 older than the newest `NIGHTLY_KEEP` (default 7). Files that a `-latest`
 link points at stay. Records, logs and manifests are never deleted.
 
+## Nightly link
+
+After each successful build, `run` points `<IMAGES_DIR>/t1-lartpc-<variant>-nightly.sif`
+at that build's `.sif` (a relative link into `nightly/`). A failed build
+leaves the link alone. Users can load the nightly image from this fixed
+path. The newest build is never pruned, so the link does not dangle.
+
 ## Dashboard
 
 `poll`, `run`, `review` and `retry` re-render the dashboard into
@@ -106,10 +113,21 @@ link points at stay. Records, logs and manifests are never deleted.
 nightly.py render --state <state> --out DIR
 ```
 
-Open `DIR/index.html` in a browser. The pages have no JavaScript and only
-relative links, so they work from the filesystem or from any static web
-server. The index shows a banner when the last poll failed, or when it
-is older than twice `POLL_INTERVAL_HOURS`.
+Open `DIR/index.html` in a browser. The pages work without JavaScript.
+One small inline script adds a light/dark toggle and remembers the choice
+in the browser; without it the pages follow the system theme. Links are
+relative, except the commit links to github.com. The pages work from the
+filesystem or from any static web server. The index shows a banner when
+the last poll failed, or when it is older than twice `POLL_INTERVAL_HOURS`.
+
+Each record stores `repos`, the clone URL of every tracked package. The
+build page links each commit to `<repo>/commit/<sha>` when the URL is on
+github.com. A record without `repos` shows plain commits.
+
+On S3DF, `DASHBOARD_DIR` is `/sdf/data/neutrino/public_html/t1-software`,
+published at <https://s3df.slac.stanford.edu/data/neutrino/t1-software/>.
+The site is public. It does not publish logs: a build page shows the log
+file location and the last 200 lines of `build.log`.
 
 ## Time limit
 
