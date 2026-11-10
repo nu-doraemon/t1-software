@@ -49,6 +49,7 @@ scripts/build.sh --help           # every option and its default
 | `--pin KEY=VALUE` | none; overrides one `versions.env` key for this build; repeatable |
 | `--tag TAG` | `<YYYYMMDD>-<git-sha8>[-dirty]` |
 | `--no-sif` | off; skips the `.sif`, the apptainer tests and the pipeline test |
+| `--no-base-archive` | off; skips the t1-base `.oci.tar` and its `-latest` link; the base is still built, tested and recorded in its manifest |
 | `--no-pipeline-test` | off; on when `T1_SKIP_PIPELINE_TEST=1` |
 | `--gpu auto\|on\|off` | `auto`: apptainer tests get `--nv` when `nvidia-smi` finds a GPU |
 | `--squashfs-mem SIZE` | `2G` |

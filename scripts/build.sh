@@ -4,8 +4,8 @@
 #
 #   scripts/build.sh [--variant cuda12] [--work-dir DIR] [--images-dir DIR]
 #                    [--cache-dir DIR] [--pin KEY=VALUE]... [--tag TAG]
-#                    [--no-sif] [--no-pipeline-test] [--gpu auto|on|off]
-#                    [--squashfs-mem SIZE] [--help]
+#                    [--no-sif] [--no-base-archive] [--no-pipeline-test]
+#                    [--gpu auto|on|off] [--squashfs-mem SIZE] [--help]
 #
 # `scripts/build.sh --help` lists each option with its default. Three
 # options fall back to an environment variable when not given:
@@ -20,7 +20,8 @@
 #
 # Outputs, in the images dir:
 #   t1-base-<variant>-<tag>.oci.tar     base only; `podman load` it to
-#                                       build an overlay elsewhere
+#                                       build an overlay elsewhere (not
+#                                       with --no-base-archive)
 #   t1-lartpc-<variant>-<tag>.oci.tar   `podman load -i` / `docker load -i`
 #   t1-lartpc-<variant>-<tag>.sif       apptainer image of the same OCI image
 #   <layer>-<variant>-<tag>.manifest.json, and -latest symlinks per file kind
@@ -77,6 +78,8 @@ usage: scripts/build.sh [options]
                          a key in neither versions.env file is an error
   --tag TAG              image tag (default: <YYYYMMDD>-<git-sha8>[-dirty])
   --no-sif               skip the .sif, the apptainer tests and the pipeline test
+  --no-base-archive      do not save the t1-base .oci.tar or its -latest link; the
+                         base is still built, tested and recorded in its manifest
   --no-pipeline-test     skip the dprod full-chain test (default: off;
                          on when T1_SKIP_PIPELINE_TEST=1)
   --gpu auto|on|off      apptainer --nv: auto probes nvidia-smi (default: auto)
@@ -96,6 +99,7 @@ CACHE_DIR="${T1_SOFTWARE_CACHE_DIR:-}"
 PINS=()
 TAG=""
 BUILD_SIF=1
+BASE_ARCHIVE=1
 PIPELINE_TEST=1
 [[ "${T1_SKIP_PIPELINE_TEST:-0}" == "1" ]] && PIPELINE_TEST=0
 GPU=auto
@@ -110,12 +114,13 @@ while (($#)); do
     opt="$1"
     val=""
     case "$opt" in
-        --help=*|--no-sif=*|--no-pipeline-test=*) die_usage "${opt%%=*} takes no value" ;;
+        --help=*|--no-sif=*|--no-base-archive=*|--no-pipeline-test=*) die_usage "${opt%%=*} takes no value" ;;
         --*=*) val="${opt#*=}"; opt="${opt%%=*}"; set -- "$opt" "$val" "${@:2}" ;;
     esac
     case "$opt" in
         --help) usage; exit 0 ;;
         --no-sif) BUILD_SIF=0; shift ;;
+        --no-base-archive) BASE_ARCHIVE=0; shift ;;
         --no-pipeline-test) PIPELINE_TEST=0; shift ;;
         --variant|--work-dir|--images-dir|--cache-dir|--pin|--tag|--gpu|--squashfs-mem)
             need_value "$opt" "$#"
@@ -340,10 +345,14 @@ LARTPC_TAR="$STAGE/t1-lartpc-${VARIANT}-${TAG}.oci.tar"
 LARTPC_SIF="$STAGE/t1-lartpc-${VARIANT}-${TAG}.sif"
 echo "== podman save -> OCI archives =="
 rm -f "$BASE_TAR" "$LARTPC_TAR"
-pm save --format oci-archive -o "$BASE_TAR" "$BASE_REF"
+OUTPUTS=()
+if (( BASE_ARCHIVE )); then
+    pm save --format oci-archive -o "$BASE_TAR" "$BASE_REF"
+    OUTPUTS+=("$BASE_TAR")
+fi
 pm save --format oci-archive -o "$LARTPC_TAR" "$LARTPC_REF"
+OUTPUTS+=("$LARTPC_TAR")
 
-OUTPUTS=("$BASE_TAR" "$LARTPC_TAR")
 if (( BUILD_SIF )); then
     echo "== apptainer build $(basename "$LARTPC_SIF") from the OCI archive =="
     # mksquashfs sizes its buffer at 25% of the node's physical RAM and
@@ -379,7 +388,11 @@ for f in "${OUTPUTS[@]}"; do
     mv "$f" "$IMAGES_DIR/"
 done
 
-update_latest "$(basename "$BASE_TAR")" "$IMAGES_DIR/t1-base-${VARIANT}-latest.oci.tar"
+# The base manifest is written even without the archive: it records the
+# base pins under the LArTPC image.
+if (( BASE_ARCHIVE )); then
+    update_latest "$(basename "$BASE_TAR")" "$IMAGES_DIR/t1-base-${VARIANT}-latest.oci.tar"
+fi
 write_manifest "$IMAGES_DIR/t1-base-${VARIANT}-${TAG}.manifest.json" "$BASE_ARGFILE"
 
 update_latest "$(basename "$LARTPC_TAR")" "$IMAGES_DIR/t1-lartpc-${VARIANT}-latest.oci.tar"

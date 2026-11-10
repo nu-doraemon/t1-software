@@ -162,6 +162,17 @@ class BuildShTest(unittest.TestCase):
         self.assertIn("== dprod full-chain test: skipped ==", r.stdout)
         self.assertNotIn("--nv", self.calls("apptainer"))
 
+    def test_no_base_archive(self):
+        r = self.run_build("--tag", "t5", "--no-base-archive", "--no-pipeline-test")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        names = {p.name for p in self.img.iterdir()}
+        self.assertEqual(names, {
+            "t1-lartpc-cuda12-t5.oci.tar", "t1-lartpc-cuda12-t5.sif",
+            "t1-lartpc-cuda12-latest.oci.tar", "t1-lartpc-cuda12-latest.sif",
+            "t1-lartpc-cuda12-t5.manifest.json", "t1-base-cuda12-t5.manifest.json"})
+        self.assertIn("/opt/t1-base-tests/image-test.sh", self.calls("podman"))
+        self.assertEqual(self.run_build("--no-base-archive=1").returncode, 2)
+
     def test_env_fallbacks(self):
         env_img = self.tmp / "envimg"
         r = self.run_build("--tag", "t4", images_dir=False, env_extra={

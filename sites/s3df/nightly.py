@@ -616,8 +616,11 @@ def _run(state, site, key):
         shutil.rmtree(src, ignore_errors=True)
         return 1
 
+    # The base layers change only with a t1-software commit, so a nightly
+    # base archive is mostly a 13+ GB copy of the previous one. The base is
+    # still built (the LArTPC image builds FROM it) and tested.
     cmd = [str(src / "scripts" / "build.sh"), "--variant", rec["variant"],
-           "--images-dir", rec["images_dir"], "--tag", rec["tag"]]
+           "--images-dir", rec["images_dir"], "--tag", rec["tag"], "--no-base-archive"]
     for k, v in sorted(rec["pins"].items()):
         cmd += ["--pin", f"{k}={v}"]
     if site["CACHE_DIR"]:

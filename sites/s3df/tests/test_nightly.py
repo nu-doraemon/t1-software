@@ -449,6 +449,7 @@ class NightlyTest(unittest.TestCase):
                      ("--tag", rec["tag"]), ("--pin", f"PKG_COMMIT={f.A}"),
                      ("--work-dir", str(f.root / "work"))]:
             self.assertEqual(argv[argv.index(a) + 1], b)
+        self.assertIn("--no-base-archive", argv)
         self.assertNotIn("T1_SKIP_PIPELINE_TEST=1", (f.root / "env.txt").read_text())
         self.assertIn("== stage-two ==", out)
         self.assertFalse((f.root / "work" / "t1-nightly" / f"{rec['key']}-src").exists())

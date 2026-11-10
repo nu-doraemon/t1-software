@@ -30,7 +30,11 @@ cron (sdfcron001, daily)
   is already in the ledger is never built again automatically, whatever
   its status. One build runs at a time.
 - **Images** go to `<IMAGES_DIR>/nightly/`, with `-latest` links, so
-  nightly images never mix with release images.
+  nightly images never mix with release images. A nightly saves the
+  t1-lartpc `.oci.tar` and `.sif` and both manifests. It builds and tests
+  t1-base but does not save its archive (`build.sh --no-base-archive`):
+  the base changes only with a t1-software commit. Use a release build
+  for a t1-base archive.
 
 ## Setup
 
