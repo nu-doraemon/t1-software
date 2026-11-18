@@ -35,6 +35,7 @@ t1-software/
 |       +-- tests/
 |           +-- image-test.sh               # base packages unchanged, imports, seam, LUCiD unit suite
 |           +-- test_photonsim_lucid.sh     # PhotonSim -> LUCiD -> HDF5 seam (lucid-run-job, 3 muons)
++-- scripts/
 |   +-- build.sh           # podman build of base + every subgroup overlay, tests, .sif conversion, dprod full-chain test
 |   +-- dprod-pipeline-test.sh  # dprod-install-test inside a built lartpc image (GPU node)
 |   +-- tests/             # fast tests of build.sh with fake podman/apptainer
@@ -81,8 +82,9 @@ user), and the Containerfiles run apt's sandbox as root.
 Podman storage, temp files, and the staged outputs live in the work dir.
 Put it on a node-local disk: rootless overlay needs a local filesystem,
 and writing multi-GB files straight to a shared/NFS images dir is much
-slower than one local write plus one move. Plan for about 80 GB there:
-about 25 GB of layers plus the archives and the `.sif`. To clear the
+slower than one local write plus one move. Plan for about 110 GB there:
+about 30 GB of layers plus the three archives and two `.sif`s (about
+70 GB together; the t1-wc pair alone is about 30 GB). To clear the
 storage, run:
 
 ```bash
@@ -127,12 +129,12 @@ To share the cache across nodes, pass `--cache-dir` (or set
 scripts/build.sh --cache-dir /path/to/shared/t1-software-cache
 ```
 
-During the two builds, the script runs a registry container
+During the builds, the script runs a registry container
 (`registry:2.8.3`, loopback only, random port) whose blob store is
 `<cache-dir>/registry`, and builds with `--cache-from` /
 `--cache-to` against it. No external registry or account is involved.
 
-- **Size:** one full set of layers is about 14 GB (6.4 GB of it is the
+- **Size:** one full set of layers is about 19 GB (6.4 GB of it is the
   `nvidia/cuda` base). Each rebuild adds the layers it changed: about
   0.1-0.5 GB for a subgroup pin, about 5 GB for Torch/JAX, 7-8 GB for
   ROOT/Geant4/Python. Nothing is pruned; plan for about 50 GB and delete
@@ -207,10 +209,11 @@ podman run --rm localhost/t1-lartpc-cuda12:<tag> python3 ...
 
 ## Runtime environment
 
-The image has one Python: conda-forge CPython 3.11 at `/opt/conda`,
-carrying Torch, JAX, PyROOT, and every subgroup package. It is active
-with no setup step -- `python3`, `root`, `dlpgen`, `edep-sim`, and the
-Geant4 data variables all work directly.
+Each image has one Python: conda-forge CPython 3.11 at `/opt/conda`,
+carrying Torch, JAX, PyROOT, and that subgroup's packages. It is active
+with no setup step -- `python3`, `root`, the Geant4 data variables, and
+the subgroup's tools (`dlpgen` and `edep-sim` in t1-lartpc,
+`lucid-run-job` and `$PHOTONSIM_BIN` in t1-wc) all work directly.
 
 The whole runtime environment is static `ENV` in the Containerfiles; no
 entrypoint or sourced script is involved. Every launch path sees it:
