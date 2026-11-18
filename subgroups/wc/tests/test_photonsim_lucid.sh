@@ -13,11 +13,13 @@ out="$(mktemp -d)"
 trap 'rm -rf "$out"' EXIT
 cd "$out"
 
-# --job-id and --output-dir are required by lucid-run-job; --master-seed
-# seeds LUCiD's own sampling. This is a smoke test, not a
-# reproducibility check.
+# --job-id and --output-dir are required by lucid-run-job; the GeV
+# configs name no detector, so --detector picks SK_WAND, the one LUCiD's
+# own production README uses. --master-seed seeds LUCiD's own sampling.
+# This is a smoke test, not a reproducibility check.
 lucid-run-job --config /opt/LUCiD/lucid/production/dataprod/configs/GeV/02_mu_smoke.json \
-    --n-events 3 --job-id 1 --master-seed 42 --output-dir "$out/data" 2>&1 | tee "$out/run.log"
+    --detector SK_WAND --n-events 3 --job-id 1 --master-seed 42 --output-dir "$out/data" \
+    2>&1 | tee "$out/run.log"
 
 fail() { echo "test_photonsim_lucid: FAILED: $*" >&2; exit 1; }
 for kind in sensor hits step labl; do
