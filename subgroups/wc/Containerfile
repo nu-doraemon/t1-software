@@ -9,8 +9,8 @@
 # Not included: GENIE (no LUCiD production config shipped at the pinned
 # commit uses `primary_source: genie`; particle-gun and supernova
 # configs need only PhotonSim), and LUCiD's SIREN example data
-# (scripts/download_data.sh in the LUCiD checkout fetches it on the host;
-# the LUCiD tests that need it skip).
+# (`python scripts/download_data.py` in the LUCiD checkout fetches it on
+# the host; the LUCiD tests that need it skip).
 #
 # One RUN per pinned unit, each preceded by its own ARG, so bumping one
 # pin rebuilds only that step and the steps after it. The units that

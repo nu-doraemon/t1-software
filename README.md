@@ -156,9 +156,11 @@ During the builds, the script runs a registry container
     edep-sim seam tests, and the full unit suites of JAXTPC, pimm-data,
     goop and pysupera.
   - wc: the base's Python packages, Geant4 and ROOT are the ones the
-    base shipped; LUCiD/flax/optax import; the PhotonSim -> LUCiD -> HDF5
-    seam (`lucid-run-job` on a three-muon smoke config, about a minute);
-    and LUCiD's default `pytest tests/` collection (about 15 min on 8
+    base shipped; LUCiD/flax/optax import; LUCiD's provenance (its own
+    commit and PhotonSim's commit, tag and Geant4, from `/opt/VERSIONS`)
+    resolves; the PhotonSim -> LUCiD -> HDF5 seam (`lucid-run-job` on a
+    three-muon smoke config with `--detector SK_WAND`, under a minute);
+    and LUCiD's default `pytest tests/` collection (about 5-6 min on 8
     cores; LUCiD's conftest forces JAX onto the CPU, and tests needing
     LUCiD's downloaded SIREN data skip).
 - `scripts/dprod-pipeline-test.sh [--work-dir DIR] <lartpc.sif>` (only when lartpc is built): dprod's
@@ -181,7 +183,7 @@ calls `build.sh` with `--pin` and `--tag` and never edits this repo. See
 
 ```bash
 apptainer exec --nv images/t1-lartpc-cuda12-latest.sif python3 ...
-apptainer exec --nv images/t1-wc-cuda12-latest.sif lucid-run-job --config ... --job-id 1 --output-dir out/
+apptainer exec --nv images/t1-wc-cuda12-latest.sif lucid-run-job --config ... --detector SK_WAND --job-id 1 --output-dir out/
 podman load -i images/t1-lartpc-cuda12-latest.oci.tar     # or: docker load -i
 podman run --rm localhost/t1-lartpc-cuda12:<tag> python3 ...
 ```
@@ -190,7 +192,13 @@ podman run --rm localhost/t1-lartpc-cuda12:<tag> python3 ...
 
 - **LUCiD** is an editable checkout at `/opt/LUCiD` (it reads `config/`
   and `data/` next to its package), installed into `/opt/conda` with the
-  base's Torch/JAX/NumPy/SciPy/h5py held at their base versions.
+  base's Torch/JAX/NumPy/SciPy/h5py held at their base versions. LUCiD
+  supports only `jax>=0.5.3,<0.6`, which is why the base pins JAX 0.5.3.
+  Its PMT overlap tables for the shipped `*_WAND` detectors are built
+  into the image.
+- **`/opt/VERSIONS`** records the LUCiD and PhotonSim commits and tags
+  and PhotonSim's Geant4 version; LUCiD copies them into every dataset
+  batch it writes.
 - **PhotonSim** runs from `$PHOTONSIM_BIN` (`/opt/PhotonSim/bin/photonsim`),
   which `lucid-run-job` reads. PhotonSim needs Geant4 >= 11.0, while the
   base stays on Geant4 10.7 for the LArTPC overlay's edep-sim fork, so
@@ -199,12 +207,11 @@ podman run --rm localhost/t1-lartpc-cuda12:<tag> python3 ...
   that prefix's Geant4 data, `ROOTSYS` and sysroot; the image's ENV,
   `geant4-config` and `root` stay the base's.
 - **Not in the image:** LUCiD's SIREN example data (run
-  `scripts/download_data.sh` from a writable LUCiD checkout on the host),
-  GENIE (`primary_source: genie` configs do not run; the shipped
-  particle-gun configs need only PhotonSim), and `snewpy` (supernova
-  config only).
-- **Licenses:** neither LUCiD nor PhotonSim ships a license file at the
-  pinned commits; settle that before redistributing the image outside
+  `python scripts/download_data.py` from a writable LUCiD checkout on
+  the host), GENIE (`primary_source: genie` configs do not run; LUCiD
+  ships none), and `snewpy` (supernova config only).
+- **Licenses:** LUCiD is Apache-2.0. PhotonSim ships no license file at
+  the pinned commit; settle that before redistributing the image outside
   the collaboration.
 
 ## Runtime environment
