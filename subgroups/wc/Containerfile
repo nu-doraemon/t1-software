@@ -97,6 +97,34 @@ RUN git clone --quiet "${LUCID_REPO}" /opt/LUCiD \
 # lucid-run-job finds PhotonSim through this variable.
 ENV PHOTONSIM_BIN=/opt/PhotonSim/bin/photonsim
 
+# Pre-build LUCiD's PMT overlap-integral tables for the detectors it
+# ships (*_WAND), about a minute or two each. LUCiD looks in its install
+# dir first, then falls back to building and writing ~/.cache; in the
+# read-only .sif that would mean every new user pays the build again.
+# The cache dir is gitignored, so the checkout stays clean.
+RUN cd /opt/LUCiD && JAX_PLATFORMS=cpu python3 -c "import glob; \
+from lucid.geometry.detector_geometry import DetectorGeometry; \
+[(DetectorGeometry.from_config(f), print('warmed', f)) for f in sorted(glob.glob('/opt/LUCiD/config/*_WAND_geom_config.json'))]" \
+ && ls -1 /opt/LUCiD/spatial_overlap_integrals/
+
+# /opt/VERSIONS: LUCiD records every dataset batch's PhotonSim commit,
+# PhotonSim tag and Geant4 version from this file (key=value lines),
+# and only for a PhotonSim under /opt/PhotonSim; without it they are
+# 'unknown'. The lucid_* keys are LUCiD's fallback when its checkout has
+# no .git (this one keeps it). geant4 is the sidecar's, the Geant4
+# PhotonSim runs with.
+RUN { printf 'lucid_sha=%s\n' "$(git -C /opt/LUCiD rev-parse HEAD)"; \
+      printf 'lucid_dirty=%s\n' "$(test -z "$(git -C /opt/LUCiD status --porcelain --untracked-files=no)" && echo false || echo true)"; \
+      printf 'lucid_ref=%s\n' "$(git -C /opt/LUCiD tag --points-at HEAD | paste -sd, | grep . || echo none)"; \
+      printf 'lucid_source=%s\n' "${LUCID_REPO}"; \
+      printf 'photonsim_sha=%s\n' "$(git -C /opt/PhotonSim rev-parse HEAD)"; \
+      printf 'photonsim_ref=%s\n' "$(git -C /opt/PhotonSim tag --points-at HEAD | paste -sd, | grep . || echo none)"; \
+      printf 'photonsim_source=%s\n' "${PHOTONSIM_REPO}"; \
+      printf 'geant4=%s\n' "$(/opt/photonsim-g4/bin/geant4-config --version)"; \
+    } > /opt/VERSIONS \
+ && cat /opt/VERSIONS \
+ && grep -qx 'lucid_dirty=false' /opt/VERSIONS
+
 COPY subgroups/wc/tests/ /opt/t1-wc-tests/
 
 # The conda installs above may have added activate.d hooks to /opt/conda.

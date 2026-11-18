@@ -25,6 +25,19 @@ echo "== base Geant4/ROOT unchanged; PhotonSim's own Geant4 =="
 [ "$(/opt/photonsim-g4/bin/geant4-config --version)" = "$(cat /opt/t1-wc/photonsim-geant4-version)" ]
 [ -x "$PHOTONSIM_BIN" ]
 
+echo "== provenance LUCiD writes into every dataset batch =="
+python3 - <<'EOF'
+import os
+from lucid.utils import code_version, photonsim_version
+commit, dirty, ref = code_version()
+ps = photonsim_version(os.environ["PHOTONSIM_BIN"])
+print("lucid", commit, "dirty", dirty, "ref", ref)
+print("photonsim", ps)
+assert len(commit) == 40 and dirty is False, (commit, dirty)
+assert len(ps["photonsim_commit"]) == 40, ps
+assert "unknown" not in (ps["photonsim_ref"], ps["geant4_version"]), ps
+EOF
+
 echo "== PhotonSim -> LUCiD seam =="
 bash /opt/t1-wc-tests/test_photonsim_lucid.sh
 

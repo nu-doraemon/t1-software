@@ -16,7 +16,7 @@ cd "$out"
 # --job-id and --output-dir are required by lucid-run-job; --master-seed
 # seeds LUCiD's own sampling. This is a smoke test, not a
 # reproducibility check.
-lucid-run-job --config /opt/LUCiD/lucid/production/configs/GeV/02_mu_smoke.json \
+lucid-run-job --config /opt/LUCiD/lucid/production/dataprod/configs/GeV/02_mu_smoke.json \
     --n-events 3 --job-id 1 --master-seed 42 --output-dir "$out/data" 2>&1 | tee "$out/run.log"
 
 fail() { echo "test_photonsim_lucid: FAILED: $*" >&2; exit 1; }
