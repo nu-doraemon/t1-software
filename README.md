@@ -1,12 +1,14 @@
 # t1-software
 
-T1-LArTPC public data-challenge container (T1-FM foundation-models thrust).
+T1 public data-challenge containers (T1-FM foundation-models thrust):
+t1-lartpc (LArTPC) and t1-wc (water Cherenkov).
 
 One shared base image (Torch x JAX, plus a ROOT x GEANT4 conda-forge
 layer used by event-generation subgroup overlays) plus one overlay per
-detector technology subgroup. Only the LArTPC subgroup exists so far.
-Every image is built once, as an OCI (Docker/Podman) image; the
-Apptainer `.sif` is converted from that same image.
+detector technology subgroup: `lartpc` and `wc`. Both overlays build
+`FROM` the same base image in the same run. Every image is built once,
+as an OCI (Docker/Podman) image; the Apptainer `.sif` is converted from
+that same image.
 
 ```
 t1-software/
@@ -25,8 +27,15 @@ t1-software/
 |           +-- test_integration.py         # JAXTPC -> pimm-data HDF5 seam smoke test
 |           +-- test_generator_edepsim.sh   # DLPGenerator -> edep-sim seam smoke test (bomb-macro -> H5DLP)
 |           +-- dprod_site_image.yaml       # dprod site config: in-image checkouts, local scheduler, no nested container
-+-- scripts/
-|   +-- build.sh           # podman build of both layers, tests, .sif conversion, dprod full-chain test
+|   +-- wc/
+|       +-- Containerfile   # FROM t1-base -> LUCiD (editable, base packages pinned) + PhotonSim on its own Geant4 11.3 prefix
+|       +-- versions.env    # LUCID_*/PHOTONSIM_* repo + commit pins, PHOTONSIM_* toolchain pins (Geant4, ROOT, GCC)
+|       +-- build/build-photonsim.sh    # PhotonSim build against /opt/photonsim-g4 only, Geant4 data links, wrapper install
+|       +-- runtime/photonsim           # $PHOTONSIM_BIN: PhotonSim with the sidecar's Geant4 data/ROOTSYS
+|       +-- tests/
+|           +-- image-test.sh               # base packages unchanged, imports, seam, LUCiD unit suite
+|           +-- test_photonsim_lucid.sh     # PhotonSim -> LUCiD -> HDF5 seam (lucid-run-job, 3 muons)
+|   +-- build.sh           # podman build of base + every subgroup overlay, tests, .sif conversion, dprod full-chain test
 |   +-- dprod-pipeline-test.sh  # dprod-install-test inside a built lartpc image (GPU node)
 |   +-- tests/             # fast tests of build.sh with fake podman/apptainer
 +-- sites/s3df/            # nightly HEAD builds on S3DF (cron + Slurm + build ledger + dashboard)
@@ -36,7 +45,8 @@ t1-software/
 ## Building
 
 ```bash
-scripts/build.sh                  # cuda12, the pins in versions.env
+scripts/build.sh                  # cuda12, base + every subgroup, the pins in versions.env
+scripts/build.sh --subgroup wc    # base + t1-wc only
 scripts/build.sh --help           # every option and its default
 ```
 
@@ -47,6 +57,7 @@ scripts/build.sh --help           # every option and its default
 | `--images-dir DIR` | `$T1_SOFTWARE_IMAGES_DIR`, else `images/` next to this repo |
 | `--cache-dir DIR` | `$T1_SOFTWARE_CACHE_DIR`; unset means node-local cache only |
 | `--pin KEY=VALUE` | none; overrides one `versions.env` key for this build; repeatable |
+| `--subgroup NAME` | all (`lartpc`, `wc`); repeatable; builds only the named overlays |
 | `--tag TAG` | `<YYYYMMDD>-<git-sha8>[-dirty]` |
 | `--no-sif` | off; skips the `.sif`, the apptainer tests and the pipeline test |
 | `--no-base-archive` | off; skips the t1-base `.oci.tar` and its `-latest` link; the base is still built, tested and recorded in its manifest |
@@ -56,8 +67,10 @@ scripts/build.sh --help           # every option and its default
 
 `--pin` builds any commit set without editing a file. Example:
 `scripts/build.sh --pin GOOP_COMMIT=<sha>` builds goop at `<sha>`. A key
-that is in neither `versions.env` is an error, and the script stops
-before it starts podman. The manifests record every pin that was used.
+that is in no `versions.env`, or in more than one, is an error, and the
+script stops before it starts podman. A key of a subgroup that is not
+selected is accepted and has no effect. The manifests record every pin
+that was used.
 
 Requires rootless `podman` and `apptainer`. No `/etc/subuid` or
 `/etc/subgid` entry is needed: the script sets
@@ -132,13 +145,21 @@ During the two builds, the script runs a registry container
 
 ### Tests run by the build
 
-- `base/tests/image-test.sh` and `subgroups/lartpc/tests/image-test.sh`:
-  imports, the JAXTPC -> pimm-data and DLPGenerator -> edep-sim seam
-  tests, and the full unit suites of JAXTPC, pimm-data, goop and
-  pysupera. They run twice: under podman (CPU) and under apptainer on
-  the converted `.sif` (`--nv` when a GPU is present). No GPU is wired
-  into podman.
-- `scripts/dprod-pipeline-test.sh [--work-dir DIR] <lartpc.sif>`: dprod's
+- `base/tests/image-test.sh` and `subgroups/<sub>/tests/image-test.sh`
+  of every built subgroup. They run twice: under podman (CPU) and under
+  apptainer on the converted `.sif` (`--nv` when a GPU is present); the
+  base checks run on each subgroup's `.sif` too. No GPU is wired into
+  podman.
+  - lartpc: imports, the JAXTPC -> pimm-data and DLPGenerator ->
+    edep-sim seam tests, and the full unit suites of JAXTPC, pimm-data,
+    goop and pysupera.
+  - wc: the base's Python packages, Geant4 and ROOT are the ones the
+    base shipped; LUCiD/flax/optax import; the PhotonSim -> LUCiD -> HDF5
+    seam (`lucid-run-job` on a three-muon smoke config, about a minute);
+    and LUCiD's default `pytest tests/` collection (about 15 min on 8
+    cores; LUCiD's conftest forces JAX onto the CPU, and tests needing
+    LUCiD's downloaded SIREN data skip).
+- `scripts/dprod-pipeline-test.sh [--work-dir DIR] <lartpc.sif>` (only when lartpc is built): dprod's
   own `dprod-install-test` inside the image -- one job through edep-sim ->
   JAXTPC (wire) -> pysupera -> JAXTPC (pixel) -> pysupera with dprod's
   local scheduler (no slurm), then dprod's event-id and provenance-chain
@@ -158,9 +179,31 @@ calls `build.sh` with `--pin` and `--tag` and never edits this repo. See
 
 ```bash
 apptainer exec --nv images/t1-lartpc-cuda12-latest.sif python3 ...
+apptainer exec --nv images/t1-wc-cuda12-latest.sif lucid-run-job --config ... --job-id 1 --output-dir out/
 podman load -i images/t1-lartpc-cuda12-latest.oci.tar     # or: docker load -i
 podman run --rm localhost/t1-lartpc-cuda12:<tag> python3 ...
 ```
+
+### WC subgroup
+
+- **LUCiD** is an editable checkout at `/opt/LUCiD` (it reads `config/`
+  and `data/` next to its package), installed into `/opt/conda` with the
+  base's Torch/JAX/NumPy/SciPy/h5py held at their base versions.
+- **PhotonSim** runs from `$PHOTONSIM_BIN` (`/opt/PhotonSim/bin/photonsim`),
+  which `lucid-run-job` reads. PhotonSim needs Geant4 >= 11.0, while the
+  base stays on Geant4 10.7 for the LArTPC overlay's edep-sim fork, so
+  PhotonSim is built against its own conda prefix `/opt/photonsim-g4`
+  (Geant4 11.3, ROOT, GCC). The wrapper gives only the PhotonSim process
+  that prefix's Geant4 data, `ROOTSYS` and sysroot; the image's ENV,
+  `geant4-config` and `root` stay the base's.
+- **Not in the image:** LUCiD's SIREN example data (run
+  `scripts/download_data.sh` from a writable LUCiD checkout on the host),
+  GENIE (`primary_source: genie` configs do not run; the shipped
+  particle-gun configs need only PhotonSim), and `snewpy` (supernova
+  config only).
+- **Licenses:** neither LUCiD nor PhotonSim ships a license file at the
+  pinned commits; settle that before redistributing the image outside
+  the collaboration.
 
 ## Runtime environment
 
@@ -196,8 +239,7 @@ Every file `build.sh` produces is named (with the default tag):
 <layer>-<cuda-variant>-<YYYYMMDD>-<git-sha>[-dirty].{oci.tar,sif,manifest.json}
 ```
 
-- `layer`: `base`, or a subgroup name (`lartpc`; future subgroups add
-  their own).
+- `layer`: `base`, or a subgroup name (`lartpc`, `wc`).
 - `cuda-variant`: `cuda12` today; `cuda13` once a driver >=580.65.06 host
   exists to build and verify it.
 - `YYYYMMDD`: UTC build date.
@@ -211,12 +253,12 @@ Per build:
 
 | File | Use |
 |---|---|
-| `t1-lartpc-<variant>-<tag>.oci.tar` | `podman load -i` / `docker load -i`; contains every layer, base included |
-| `t1-lartpc-<variant>-<tag>.sif` | apptainer image converted from that OCI image |
+| `t1-<sub>-<variant>-<tag>.oci.tar` | per subgroup (`lartpc`, `wc`); `podman load -i` / `docker load -i`; contains every layer, base included |
+| `t1-<sub>-<variant>-<tag>.sif` | apptainer image converted from that OCI image |
 | `t1-base-<variant>-<tag>.oci.tar` | the base alone, to build an overlay on another node without rebuilding base |
 | `<layer>-<variant>-<tag>.manifest.json` | build timestamp, cuda variant, this repo's git commit, and the layer's upstream pins |
 
-`t1-lartpc-<variant>-latest.sif`, `t1-lartpc-<variant>-latest.oci.tar`
+`t1-<sub>-<variant>-latest.sif`, `t1-<sub>-<variant>-latest.oci.tar`
 and `t1-base-<variant>-latest.oci.tar` are symlinks to the newest dated
 build in the same images dir. **These are the pointers to follow for
 "the latest build"**; scripts and downstream consumers should target
@@ -230,10 +272,12 @@ layer in `sites/s3df/` prunes its own old images.
 
 ## Adding a new detector-technology subgroup
 
-Copy `subgroups/lartpc/` as a template: one `Containerfile` starting
-`ARG BASE_IMAGE` / `FROM ${BASE_IMAGE}`, one `versions.env` for its own
-third-party pins, its runtime paths as `ENV` lines ending with `RUN
+Copy `subgroups/wc/` (the smaller one) as a template: one `Containerfile`
+starting `ARG BASE_IMAGE` / `FROM ${BASE_IMAGE}`, one `versions.env` for
+its own third-party pins (key names unique across every `versions.env`),
+its runtime paths as `ENV` lines ending with `RUN
 /opt/t1-runtime/check-env.sh`, and a `tests/` directory with an
-`image-test.sh` plus
-at least one integration smoke test proving the subgroup's own
-data-pipeline seam. Wire it into `scripts/build.sh`.
+`image-test.sh` (copied to `/opt/t1-<name>-tests/`) plus at least one
+integration smoke test proving the subgroup's own data-pipeline seam.
+Add the name to `SUBGROUPS_ALL` in `scripts/build.sh` and to
+`SUBGROUPS` in `sites/s3df/nightly.py`.
