@@ -30,9 +30,9 @@ cron (sdfcron001, daily)
   is already in the ledger is never built again automatically, whatever
   its status. One build runs at a time.
 - **Images** go to `<IMAGES_DIR>/nightly/`, with `-latest` links, so
-  nightly images never mix with release images. A nightly saves the
-  t1-lartpc `.oci.tar` and `.sif` and both manifests. It builds and tests
-  t1-base but does not save its archive (`build.sh --no-base-archive`):
+  nightly images never mix with release images. A nightly saves every
+  subgroup's `.oci.tar` and `.sif` (t1-lartpc, t1-wc) and all manifests.
+  It builds and tests t1-base but does not save its archive (`build.sh --no-base-archive`):
   the base changes only with a t1-software commit. Use a release build
   for a t1-base archive.
 
@@ -99,10 +99,12 @@ link points at stay. Records, logs and manifests are never deleted.
 
 ## Nightly link
 
-After each successful build, `run` points `<IMAGES_DIR>/t1-lartpc-<variant>-nightly.sif`
+After each successful build, `run` points `<IMAGES_DIR>/t1-<subgroup>-<variant>-nightly.sif`
+(one link per subgroup in `SUBGROUPS` of `nightly.py`: lartpc, wc)
 at that build's `.sif` (a relative link into `nightly/`). A failed build
-leaves the link alone. Users can load the nightly image from this fixed
-path. The newest build is never pruned, so the link does not dangle.
+leaves the links alone; the dashboard index shows one line per link.
+Users can load the nightly images from these fixed paths. The newest
+build is never pruned, so the links do not dangle.
 
 ## Dashboard
 

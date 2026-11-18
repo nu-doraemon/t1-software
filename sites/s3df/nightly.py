@@ -56,6 +56,9 @@ import dashboard  # sites/s3df/dashboard.py; a script's own directory is on sys.
 
 T1 = "T1_SOFTWARE_COMMIT"
 ACTIVE = ("queued", "running")
+# Subgroup overlays build.sh builds by default; each gets its own
+# t1-<subgroup>-<variant>-nightly.sif link after a successful build.
+SUBGROUPS = ("lartpc", "wc")
 RETRYABLE = ("failed", "interrupted", "cancelled")
 SLURM_ALIVE = {"PENDING", "RUNNING", "REQUEUED", "SUSPENDED", "CONFIGURING",
                "COMPLETING", "RESIZING"}
@@ -285,17 +288,18 @@ def resolve_heads(state, site):
     return heads, repos
 
 
-def nightly_link(site, variant):
-    """Path of the symlink to the newest nightly .sif of a variant, next to nightly/."""
-    return Path(site["IMAGES_DIR"]) / f"t1-lartpc-{variant}-nightly.sif"
+def nightly_link(site, variant, subgroup):
+    """Path of the symlink to a subgroup's newest nightly .sif of a variant, next to nightly/."""
+    return Path(site["IMAGES_DIR"]) / f"t1-{subgroup}-{variant}-nightly.sif"
 
 
-def update_nightly_link(site, rec):
-    """Point nightly_link at rec's .sif with a relative target. Returns
-    False when the image file is missing or the link cannot be written.
+def update_nightly_link(site, rec, subgroup):
+    """Point the subgroup's nightly_link at rec's .sif with a relative
+    target. Returns False when the image file is missing or the link
+    cannot be written.
     """
-    sif = Path(rec["images_dir"]) / f"t1-lartpc-{rec['variant']}-{rec['tag']}.sif"
-    link = nightly_link(site, rec["variant"])
+    sif = Path(rec["images_dir"]) / f"t1-{subgroup}-{rec['variant']}-{rec['tag']}.sif"
+    link = nightly_link(site, rec["variant"], subgroup)
     if not sif.is_file():
         return False
     tmp = link.with_name(f".{link.name}.tmp.{os.getpid()}")
@@ -599,7 +603,7 @@ def refresh(state, site, out=None):
                 build_dirs={r["key"]: build_dir(state, r["key"]) for r in records},
                 image_infos={r["key"]: load_json(build_dir(state, r["key"]) / "image-info.json")
                              for r in records},
-                nightly_link=nightly_link(site, site["VARIANT"]),
+                nightly_links={s: nightly_link(site, site["VARIANT"], s) for s in SUBGROUPS},
                 now=datetime.now(timezone.utc))
     except Exception as e:  # the dashboard must never break a poll or a build
         print(f"render failed: {e}", file=sys.stderr, flush=True)
@@ -724,7 +728,7 @@ def _run(state, site, key):
 
     # The base layers change only with a t1-software commit, so a nightly
     # base archive is mostly a 13+ GB copy of the previous one. The base is
-    # still built (the LArTPC image builds FROM it) and tested.
+    # still built (every subgroup image builds FROM it) and tested.
     cmd = [str(src / "scripts" / "build.sh"), "--variant", rec["variant"],
            "--images-dir", rec["images_dir"], "--tag", rec["tag"], "--no-base-archive"]
     for k, v in sorted(rec["pins"].items()):
@@ -777,7 +781,8 @@ def _run(state, site, key):
         return 143
     if rc == 0:
         finish(state, key, "success", None)
-        update_nightly_link(site, rec)
+        for subgroup in SUBGROUPS:
+            update_nightly_link(site, rec, subgroup)
         write_image_info(state, site, rec)
     else:
         finish(state, key, "failed", "cache lock" if lock_busy else stage)

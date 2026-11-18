@@ -17,7 +17,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 LOG_TAIL = 200  # lines of build.log shown on a build page
-INDEX_TITLE = "T1-LArTPC nightly builds"
+INDEX_TITLE = "T1 software nightly builds"
 T1 = "T1_SOFTWARE_COMMIT"
 REVIEW_SECTION = ("failed", "interrupted", "cancelled")
 
@@ -148,9 +148,9 @@ def log_names(src_dir):
     return names
 
 
-def image_file(record):
+def image_file(record, subgroup="lartpc"):
     d = Path(record["images_dir"])
-    return d / f"t1-lartpc-{record['variant']}-{record['tag']}.sif"
+    return d / f"t1-{subgroup}-{record['variant']}-{record['tag']}.sif"
 
 
 def is_pruned(record):
@@ -202,20 +202,20 @@ def review_html(review_state):
     return f"<span class=\"{cls}\">{esc(review_state)}</span>"
 
 
-def nightly_build(link, records):
-    """The record whose .sif the nightly symlink points at, or None."""
+def nightly_build(link, records, subgroup="lartpc"):
+    """The record whose subgroup .sif the nightly symlink points at, or None."""
     if link is None or not os.path.islink(link):
         return None
     name = os.path.basename(os.readlink(link))
-    return next((r for r in records if name == image_file(r).name), None)
+    return next((r for r in records if name == image_file(r, subgroup).name), None)
 
 
-def nightly_line(link, records):
+def nightly_line(link, records, subgroup="lartpc"):
     """The nightly symlink and the build it points at; "" when there is no link."""
     if link is None or not os.path.islink(link):
         return ""
     target = os.readlink(link)
-    build = nightly_build(link, records)
+    build = nightly_build(link, records, subgroup)
     of = (f" (build <a href=\"builds/{esc(build['key'])}.html\"><code>{esc(build['key'])}</code></a>)"
           if build else "")
     return f"Nightly image: <code>{esc(link)}</code> &rarr; <code>{esc(target)}</code>{of}"
@@ -259,7 +259,7 @@ def render_image_page(out, record, info):
                       f"Image of build <code>{esc(key)}</code>", body))
 
 
-def render_index(out, site, records, review_states, last_poll, nightly_link, nightly_info, now):
+def render_index(out, site, records, review_states, last_poll, nightly_links, nightly_info, now):
     parts = []
     for cls, text in banners(site, last_poll, now):
         parts.append(f"<div class=\"banner {cls}\">{esc(text)}</div>")
@@ -274,11 +274,15 @@ def render_index(out, site, records, review_states, last_poll, nightly_link, nig
                     f"Rendered {esc(now.strftime('%Y-%m-%dT%H:%M:%SZ'))}.")
     parts.append(f"<p class=\"meta\">{'<br>'.join(meta)}</p>")
     lines = []
+    # The base stack (image-info) is read from the lartpc image; every
+    # overlay shares that base.
     if nightly_info:
+        lartpc = nightly_build(nightly_links.get("lartpc"), records)
         lines.append(f"Base image: {key_versions(nightly_info)} &middot; "
-                     f"<a href=\"builds/{esc(nightly_build(nightly_link, records)['key'])}-image.html\">details</a>")
-    if nightly_line(nightly_link, records):
-        lines.append(nightly_line(nightly_link, records))
+                     f"<a href=\"builds/{esc(lartpc['key'])}-image.html\">details</a>")
+    for subgroup, link in nightly_links.items():
+        if nightly_line(link, records, subgroup):
+            lines.append(nightly_line(link, records, subgroup))
     if lines:
         parts.append(f"<p class=\"meta\">{'<br>'.join(lines)}</p>")
     rows = []
@@ -375,12 +379,14 @@ def render_build(out, record, review, review_state, src_dir, info=None):
 
 
 def render(out, *, site, records, reviews, review_states, last_poll, build_dirs,
-           image_infos=None, nightly_link=None, now):
+           image_infos=None, nightly_links=None, now):
+    """nightly_links: {subgroup: path of its nightly .sif symlink}."""
     out = Path(out)
     image_infos = image_infos or {}
+    nightly_links = nightly_links or {}
     (out / "builds").mkdir(parents=True, exist_ok=True)
-    nightly = nightly_build(nightly_link, records)
-    render_index(out, site, records, review_states, last_poll, nightly_link,
+    nightly = nightly_build(nightly_links.get("lartpc"), records)
+    render_index(out, site, records, review_states, last_poll, nightly_links,
                  image_infos.get(nightly["key"]) if nightly else None, now)
     for rec in records:
         key = rec["key"]

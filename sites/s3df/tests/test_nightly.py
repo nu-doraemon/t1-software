@@ -285,6 +285,16 @@ class NightlyTest(unittest.TestCase):
         self.assertEqual(newest["changed"], {"PKG_COMMIT": [f.A, B]})
         self.assertEqual(newest["pins"], {"PKG_COMMIT": B})
 
+    def test_resolve_heads_second_subgroup(self):
+        f = self.fixture()
+        (f.t1_src / "subgroups/wc").mkdir(parents=True)
+        (f.t1_src / "subgroups/wc/versions.env").write_text(
+            f"WPKG_REPO=file://{f.pkg_git}\nWPKG_COMMIT={f.A}\n")
+        f.commit_t1("add wc pins")
+        B = f.commit_pkg("b")
+        f.poll()
+        self.assertEqual(f.only_record()["pins"], {"PKG_COMMIT": B, "WPKG_COMMIT": B})
+
     def test_record_order_tiebreak(self):
         f = self.fixture()
         for key, job in [("aaaaaaaaaaaa", "120"), ("bbbbbbbbbbbb", "9"), ("cccccccccccc", "300")]:
@@ -482,26 +492,31 @@ class NightlyTest(unittest.TestCase):
     def test_run_updates_nightly_link(self):
         f, rec = self.polled()
         img = f.root / "img"
-        link = img / "t1-lartpc-cuda12-nightly.sif"
         (img / "nightly").mkdir(parents=True)
-        sif = img / "nightly" / f"t1-lartpc-cuda12-{rec['tag']}.sif"
+        links = {s: img / f"t1-{s}-cuda12-nightly.sif" for s in nightly.SUBGROUPS}
+        sifs = {s: img / "nightly" / f"t1-{s}-cuda12-{rec['tag']}.sif" for s in nightly.SUBGROUPS}
+        olds = {s: img / "nightly" / f"t1-{s}-cuda12-19700101-old.sif" for s in nightly.SUBGROUPS}
         # The fake build.sh writes no image: no image, no link.
         f.main("run", rec["key"])
-        self.assertFalse(os.path.lexists(link))
-        sif.write_text("x")
-        old = img / "nightly" / "t1-lartpc-cuda12-19700101-old.sif"
-        old.write_text("y")
-        link.symlink_to(f"nightly/{old.name}")
+        for link in links.values():
+            self.assertFalse(os.path.lexists(link))
+        for s in nightly.SUBGROUPS:
+            sifs[s].write_text("x")
+            olds[s].write_text("y")
+            links[s].symlink_to(f"nightly/{olds[s].name}")
         f.set_status(rec["key"], "queued")
         f.main("run", rec["key"])
-        self.assertEqual(os.readlink(link), f"nightly/{sif.name}")
-        # A failed build leaves the link alone.
-        link.unlink()
-        link.symlink_to(f"nightly/{old.name}")
+        for s in nightly.SUBGROUPS:
+            self.assertEqual(os.readlink(links[s]), f"nightly/{sifs[s].name}")
+        # A failed build leaves the links alone.
+        for s in nightly.SUBGROUPS:
+            links[s].unlink()
+            links[s].symlink_to(f"nightly/{olds[s].name}")
         os.environ["FAKE_BUILD_RC"] = "1"
         f.set_status(rec["key"], "queued")
         f.main("run", rec["key"])
-        self.assertEqual(os.readlink(link), f"nightly/{old.name}")
+        for s in nightly.SUBGROUPS:
+            self.assertEqual(os.readlink(links[s]), f"nightly/{olds[s].name}")
 
     def test_compose_image_info(self):
         raw = json.loads(RAW_IMAGE)
@@ -692,14 +707,18 @@ class NightlyTest(unittest.TestCase):
     def test_render_pages(self):
         f, keys = self.dashboard_fixture()
         ok = nightly.load_json(nightly.record_path(f.state, keys["ok"]))
-        self.assertTrue(nightly.update_nightly_link(nightly.load_site(f.state), ok))
+        site = nightly.load_site(f.state)
+        self.assertTrue(nightly.update_nightly_link(site, ok, "lartpc"))
+        wc_sif = Path(ok["images_dir"]) / f"t1-wc-cuda12-{ok['tag']}.sif"
+        wc_sif.write_text("x")
+        self.assertTrue(nightly.update_nightly_link(site, ok, "wc"))
         out = f.root / "out"
         rc, _, err = f.main("render", "--out", str(out))
         self.assertEqual(rc, 0, err)
         index = (out / "index.html").read_text()
         for key in keys.values():
             self.assertTrue((out / "builds" / f"{key}.html").exists())
-        self.assertIn("<title>T1-LArTPC nightly builds</title>", index)
+        self.assertIn("<title>T1 software nightly builds</title>", index)
         self.assertIn("Poller stale", index)
         self.assertIn("reviewed", self.index_row(index, keys["rev"]))
         self.assertIn("needs review", self.index_row(index, keys["bad"]))
@@ -708,6 +727,9 @@ class NightlyTest(unittest.TestCase):
         self.assertIn("2026-11-01 00:00Z", self.index_row(index, keys["ok"]))
         self.assertIn("t1-lartpc-cuda12-nightly.sif", index)
         self.assertIn(f"&rarr; <code>nightly/t1-lartpc-cuda12-20261101-{keys['ok']}.sif</code>", index)
+        self.assertIn("t1-wc-cuda12-nightly.sif", index)
+        self.assertIn(f"&rarr; <code>nightly/t1-wc-cuda12-20261101-{keys['ok']}.sif</code>", index)
+        self.assertEqual(index.count("Nightly image:"), 2)
         self.assertIn("5 builds: 2 succeeded, 2 failed, 1 need review", index)
         self.assertIn("Base image: PyTorch <code>2.13.0+cu129</code>", index)
         self.assertIn(f'href="builds/{keys["ok"]}-image.html"', index)
