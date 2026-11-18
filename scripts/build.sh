@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Build the T1-LArTPC container stack: the shared base image and the
-# LArTPC overlay, their tests, and the apptainer .sif.
+# Build the T1 container stack: the shared base image and every subgroup
+# overlay (lartpc, wc) on top of it, their tests, and the apptainer .sifs.
 #
 #   scripts/build.sh [--variant cuda12] [--work-dir DIR] [--images-dir DIR]
-#                    [--cache-dir DIR] [--pin KEY=VALUE]... [--tag TAG]
-#                    [--no-sif] [--no-base-archive] [--no-pipeline-test]
+#                    [--cache-dir DIR] [--pin KEY=VALUE]... [--subgroup NAME]...
+#                    [--tag TAG] [--no-sif] [--no-base-archive] [--no-pipeline-test]
 #                    [--gpu auto|on|off] [--squashfs-mem SIZE] [--help]
 #
 # `scripts/build.sh --help` lists each option with its default. Three
@@ -13,17 +13,20 @@
 #   --cache-dir         $T1_SOFTWARE_CACHE_DIR  (else node-local cache only)
 #   --no-pipeline-test  on when T1_SKIP_PIPELINE_TEST=1
 #
-# Without --pin, the build uses the pins in base/versions.env and
-# subgroups/lartpc/versions.env. A release build is that default path
-# with a version --tag. --pin KEY=VALUE overrides one pin for this build
-# only; it never edits a file.
+# Without --subgroup, every subgroup in SUBGROUPS_ALL is built; the base
+# is built once and shared. Without --pin, the build uses the pins in
+# base/versions.env and subgroups/<name>/versions.env. A release build is
+# that default path with a version --tag. --pin KEY=VALUE overrides one
+# pin for this build only; it never edits a file. Its key may come from
+# any subgroup's versions.env, built this run or not, so one --pin set
+# serves every --subgroup selection.
 #
 # Outputs, in the images dir:
 #   t1-base-<variant>-<tag>.oci.tar     base only; `podman load` it to
 #                                       build an overlay elsewhere (not
 #                                       with --no-base-archive)
-#   t1-lartpc-<variant>-<tag>.oci.tar   `podman load -i` / `docker load -i`
-#   t1-lartpc-<variant>-<tag>.sif       apptainer image of the same OCI image
+#   t1-<sub>-<variant>-<tag>.oci.tar    per subgroup; `podman load -i` / `docker load -i`
+#   t1-<sub>-<variant>-<tag>.sif        apptainer image of the same OCI image
 #   <layer>-<variant>-<tag>.manifest.json, and -latest symlinks per file kind
 #
 # Rootless podman without a /etc/subuid entry maps a single UID, so:
@@ -37,7 +40,7 @@
 # storage is reused by the next build on the same node only.
 #
 # Shared layer cache (optional): --cache-dir names a persistent directory
-# on shared storage. For the two builds, the script starts a registry
+# on shared storage. For the builds, the script starts a registry
 # container (REGISTRY_IMAGE, below) on 127.0.0.1 with its blob store in
 # <cache-dir>/registry, and builds with --cache-from/--cache-to against
 # it. A build on any node then reuses every step whose inputs are
@@ -45,10 +48,11 @@
 # fast on <cache-dir>/.lock. The cache is disposable -- delete the
 # directory to reclaim space; the next build repopulates it.
 #
-# Tests: the image-test.sh scripts run under podman (CPU) and under
-# apptainer (--nv when a GPU is present); both see the image's static
-# ENV with no setup step. Then dprod-pipeline-test.sh runs on the .sif.
-# Nothing leaves the work dir unless all of them pass.
+# Tests: the base's and each subgroup's image-test.sh run under podman
+# (CPU) and under apptainer (--nv when a GPU is present); both see the
+# image's static ENV with no setup step. When lartpc is built,
+# dprod-pipeline-test.sh then runs on its .sif. Nothing leaves the work
+# dir unless all of them pass.
 #
 # Versioning: see README.md "Image versioning". The default tag is
 # <date>-<git-sha>[-dirty]; a JSON manifest next to each layer records
@@ -56,6 +60,11 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+# Every subgroup overlay, in build order. A new subgroup adds its name
+# here (and a subgroups/<name>/ directory with Containerfile,
+# versions.env and tests/image-test.sh).
+SUBGROUPS_ALL=(lartpc wc)
 
 die_usage() {
     echo "build.sh: $*" >&2
@@ -75,9 +84,11 @@ usage: scripts/build.sh [options]
   --cache-dir DIR        shared layer cache (default: $T1_SOFTWARE_CACHE_DIR;
                          unset means node-local cache only)
   --pin KEY=VALUE        override one versions.env key for this build; repeatable;
-                         a key in neither versions.env file is an error
+                         a key in no versions.env file, or in more than one, is an error
+  --subgroup NAME        build only this subgroup overlay; repeatable
+                         (default: all of lartpc wc)
   --tag TAG              image tag (default: <YYYYMMDD>-<git-sha8>[-dirty])
-  --no-sif               skip the .sif, the apptainer tests and the pipeline test
+  --no-sif               skip the .sifs, the apptainer tests and the pipeline test
   --no-base-archive      do not save the t1-base .oci.tar or its -latest link; the
                          base is still built, tested and recorded in its manifest
   --no-pipeline-test     skip the dprod full-chain test (default: off;
@@ -97,6 +108,7 @@ fi
 IMAGES_DIR="${T1_SOFTWARE_IMAGES_DIR:-$REPO_ROOT/images}"
 CACHE_DIR="${T1_SOFTWARE_CACHE_DIR:-}"
 PINS=()
+REQUESTED=()
 TAG=""
 BUILD_SIF=1
 BASE_ARCHIVE=1
@@ -122,7 +134,7 @@ while (($#)); do
         --no-sif) BUILD_SIF=0; shift ;;
         --no-base-archive) BASE_ARCHIVE=0; shift ;;
         --no-pipeline-test) PIPELINE_TEST=0; shift ;;
-        --variant|--work-dir|--images-dir|--cache-dir|--pin|--tag|--gpu|--squashfs-mem)
+        --variant|--work-dir|--images-dir|--cache-dir|--pin|--subgroup|--tag|--gpu|--squashfs-mem)
             need_value "$opt" "$#"
             val="$2"
             case "$opt" in
@@ -131,6 +143,7 @@ while (($#)); do
                 --images-dir) IMAGES_DIR="$val" ;;
                 --cache-dir) CACHE_DIR="$val" ;;
                 --pin) PINS+=("$val") ;;
+                --subgroup) REQUESTED+=("$val") ;;
                 --tag) TAG="$val" ;;
                 --gpu) GPU="$val" ;;
                 --squashfs-mem) SQUASHFS_MEM="$val" ;;
@@ -151,6 +164,23 @@ case "$GPU" in
 esac
 [[ -n "$WORK_DIR" && -n "$IMAGES_DIR" ]] || die_usage "--work-dir and --images-dir must not be empty"
 
+for sub in "${REQUESTED[@]}"; do
+    case " ${SUBGROUPS_ALL[*]} " in
+        *" $sub "*) ;;
+        *) die_usage "unknown subgroup '$sub' (expected: ${SUBGROUPS_ALL[*]})" ;;
+    esac
+done
+# SELECTED keeps SUBGROUPS_ALL's order, whatever order --subgroup came in.
+SELECTED=()
+for sub in "${SUBGROUPS_ALL[@]}"; do
+    if (( ${#REQUESTED[@]} == 0 )) || [[ " ${REQUESTED[*]} " == *" $sub "* ]]; then
+        SELECTED+=("$sub")
+    fi
+done
+is_selected() {
+    [[ " ${SELECTED[*]} " == *" $1 "* ]]
+}
+
 # Absolute before the cd below: a relative path is meant from the
 # caller's cwd, and podman's -v reads a relative source as a volume name.
 WORK_DIR="$(realpath -m "$WORK_DIR")"
@@ -169,10 +199,17 @@ argfile() {
     grep -E '^[A-Za-z_][A-Za-z0-9_]*=' "$1"
 }
 
-BASE_ARGFILE="$TMPDIR/base.args"
-LARTPC_ARGFILE="$TMPDIR/lartpc.args"
-argfile base/versions.env > "$BASE_ARGFILE"
-argfile subgroups/lartpc/versions.env > "$LARTPC_ARGFILE"
+# One effective argument file per layer, for every subgroup (selected or
+# not), so --pin can resolve any key. ARGFILES[base] first, then the
+# subgroups in SUBGROUPS_ALL order.
+declare -A ARGFILES
+ARGFILES[base]="$TMPDIR/base.args"
+argfile base/versions.env > "${ARGFILES[base]}"
+for sub in "${SUBGROUPS_ALL[@]}"; do
+    ARGFILES[$sub]="$TMPDIR/$sub.args"
+    argfile "subgroups/$sub/versions.env" > "${ARGFILES[$sub]}"
+done
+LAYERS=(base "${SUBGROUPS_ALL[@]}")
 
 # has_key <argfile> <key>
 has_key() {
@@ -197,26 +234,26 @@ for kv in "${PINS[@]}"; do
     key="${kv%%=*}"
     value="${kv#*=}"
     [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || die_usage "--pin key '$key' is not a valid name"
-    in_base=0; in_lartpc=0
-    if has_key "$BASE_ARGFILE" "$key"; then in_base=1; fi
-    if has_key "$LARTPC_ARGFILE" "$key"; then in_lartpc=1; fi
-    case "$in_base$in_lartpc" in
-        00) die_usage "--pin $key is not in base/versions.env or subgroups/lartpc/versions.env" ;;
-        11) die_usage "--pin $key is in both versions.env files" ;;
-        10) set_key "$BASE_ARGFILE" "$key" "$value" ;;
-        01) set_key "$LARTPC_ARGFILE" "$key" "$value" ;;
+    owners=()
+    for layer in "${LAYERS[@]}"; do
+        if has_key "${ARGFILES[$layer]}" "$key"; then owners+=("$layer"); fi
+    done
+    case "${#owners[@]}" in
+        0) die_usage "--pin $key is not in base/versions.env or any subgroups/*/versions.env" ;;
+        1) set_key "${ARGFILES[${owners[0]}]}" "$key" "$value" ;;
+        *) die_usage "--pin $key is in more than one versions.env file (${owners[*]})" ;;
     esac
 done
 
 # An empty <PKG>_REPO would reach `git clone ""` inside the build and fail
 # there with an unclear error; catch it here.
-for f in "$BASE_ARGFILE" "$LARTPC_ARGFILE"; do
+for layer in "${LAYERS[@]}"; do
     while IFS= read -r line; do
         key="${line%%=*}"
         if [[ "$key" == *_REPO && -z "${line#*=}" ]]; then
             die_usage "$key is empty"
         fi
-    done < "$f"
+    done < "${ARGFILES[$layer]}"
 done
 
 mkdir -p "$IMAGES_DIR"
@@ -281,8 +318,11 @@ write_manifest() {
     } > "$manifest"
 }
 
-BASE_REF="localhost/t1-base-${VARIANT}:${TAG}"
-LARTPC_REF="localhost/t1-lartpc-${VARIANT}:${TAG}"
+# ref <layer>: the local image reference of a layer.
+ref() {
+    echo "localhost/t1-$1-${VARIANT}:${TAG}"
+}
+BASE_REF="$(ref base)"
 
 # Pinned: a registry upgrade must never change the on-disk cache format
 # silently.
@@ -320,17 +360,19 @@ cache_args() {  # cache_args <repo>
     [[ -n "$REGISTRY_NAME" ]] || return 0
     printf '%s\n' "${CACHE_ARGS[@]}" --cache-from "$REGISTRY/$1" --cache-to "$REGISTRY/$1"
 }
-mapfile -t BASE_CACHE < <(cache_args t1-base-cache)
-mapfile -t LARTPC_CACHE < <(cache_args t1-lartpc-cache)
 
 echo "== podman build ${BASE_REF} =="
-pm build "${BASE_CACHE[@]}" --build-arg-file "$BASE_ARGFILE" \
+mapfile -t layer_cache < <(cache_args t1-base-cache)
+pm build "${layer_cache[@]}" --build-arg-file "${ARGFILES[base]}" \
     -f base/Containerfile -t "$BASE_REF" base
 
-echo "== podman build ${LARTPC_REF} =="
-pm build "${LARTPC_CACHE[@]}" --build-arg-file "$LARTPC_ARGFILE" \
-    --build-arg "BASE_IMAGE=${BASE_REF}" \
-    -f subgroups/lartpc/Containerfile -t "$LARTPC_REF" .
+for sub in "${SELECTED[@]}"; do
+    echo "== podman build $(ref "$sub") =="
+    mapfile -t layer_cache < <(cache_args "t1-$sub-cache")
+    pm build "${layer_cache[@]}" --build-arg-file "${ARGFILES[$sub]}" \
+        --build-arg "BASE_IMAGE=${BASE_REF}" \
+        -f "subgroups/$sub/Containerfile" -t "$(ref "$sub")" .
+done
 
 # The cache is needed only by the builds; release it for other builds now.
 stop_registry
@@ -338,43 +380,55 @@ exec 9>&-
 
 echo "== image tests under podman (CPU) =="
 pm run --rm "$BASE_REF" bash /opt/t1-base-tests/image-test.sh
-pm run --rm "$LARTPC_REF" bash /opt/t1-lartpc-tests/image-test.sh
+for sub in "${SELECTED[@]}"; do
+    pm run --rm "$(ref "$sub")" bash "/opt/t1-$sub-tests/image-test.sh"
+done
 
-BASE_TAR="$STAGE/t1-base-${VARIANT}-${TAG}.oci.tar"
-LARTPC_TAR="$STAGE/t1-lartpc-${VARIANT}-${TAG}.oci.tar"
-LARTPC_SIF="$STAGE/t1-lartpc-${VARIANT}-${TAG}.sif"
+# staged <layer> <suffix>: the layer's file in the staging dir.
+staged() {
+    echo "$STAGE/t1-$1-${VARIANT}-${TAG}.$2"
+}
 echo "== podman save -> OCI archives =="
-rm -f "$BASE_TAR" "$LARTPC_TAR"
 OUTPUTS=()
 if (( BASE_ARCHIVE )); then
-    pm save --format oci-archive -o "$BASE_TAR" "$BASE_REF"
-    OUTPUTS+=("$BASE_TAR")
+    rm -f "$(staged base oci.tar)"
+    pm save --format oci-archive -o "$(staged base oci.tar)" "$BASE_REF"
+    OUTPUTS+=("$(staged base oci.tar)")
 fi
-pm save --format oci-archive -o "$LARTPC_TAR" "$LARTPC_REF"
-OUTPUTS+=("$LARTPC_TAR")
+for sub in "${SELECTED[@]}"; do
+    rm -f "$(staged "$sub" oci.tar)"
+    pm save --format oci-archive -o "$(staged "$sub" oci.tar)" "$(ref "$sub")"
+    OUTPUTS+=("$(staged "$sub" oci.tar)")
+done
 
 if (( BUILD_SIF )); then
-    echo "== apptainer build $(basename "$LARTPC_SIF") from the OCI archive =="
-    # mksquashfs sizes its buffer at 25% of the node's physical RAM and
-    # ignores the job's cgroup limit, so in a small Slurm allocation the
-    # kernel OOM-kills it. A fixed buffer (--squashfs-mem, default 2G)
-    # fits any allocation that can run the tests at all.
-    apptainer build --force --mksquashfs-args "-mem ${SQUASHFS_MEM}" "$LARTPC_SIF" "oci-archive://$LARTPC_TAR"
-    OUTPUTS+=("$LARTPC_SIF")
-
-    echo "== image tests under apptainer =="
     GPU_FLAG=()
     case "$GPU" in
         on) GPU_FLAG=(--nv) ;;
         auto) nvidia-smi -L > /dev/null 2>&1 && GPU_FLAG=(--nv) ;;
         off) ;;
     esac
-    apptainer exec "${GPU_FLAG[@]}" "$LARTPC_SIF" bash /opt/t1-base-tests/image-test.sh
-    apptainer exec "${GPU_FLAG[@]}" "$LARTPC_SIF" bash /opt/t1-lartpc-tests/image-test.sh
+    for sub in "${SELECTED[@]}"; do
+        sif="$(staged "$sub" sif)"
+        echo "== apptainer build $(basename "$sif") from the OCI archive =="
+        # mksquashfs sizes its buffer at 25% of the node's physical RAM and
+        # ignores the job's cgroup limit, so in a small Slurm allocation the
+        # kernel OOM-kills it. A fixed buffer (--squashfs-mem, default 2G)
+        # fits any allocation that can run the tests at all.
+        apptainer build --force --mksquashfs-args "-mem ${SQUASHFS_MEM}" "$sif" \
+            "oci-archive://$(staged "$sub" oci.tar)"
+        OUTPUTS+=("$sif")
 
-    if (( PIPELINE_TEST )); then
+        echo "== image tests under apptainer: $sub =="
+        apptainer exec "${GPU_FLAG[@]}" "$sif" bash /opt/t1-base-tests/image-test.sh
+        apptainer exec "${GPU_FLAG[@]}" "$sif" bash "/opt/t1-$sub-tests/image-test.sh"
+    done
+
+    if ! is_selected lartpc; then
+        echo "== dprod full-chain test: skipped (lartpc not selected) =="
+    elif (( PIPELINE_TEST )); then
         echo "== dprod full-chain test (edep-sim -> JAXTPC -> pysupera, GPU) =="
-        scripts/dprod-pipeline-test.sh --work-dir "$WORK_DIR" "$LARTPC_SIF"
+        scripts/dprod-pipeline-test.sh --work-dir "$WORK_DIR" "$(staged lartpc sif)"
     else
         echo "== dprod full-chain test: skipped =="
     fi
@@ -389,17 +443,19 @@ for f in "${OUTPUTS[@]}"; do
 done
 
 # The base manifest is written even without the archive: it records the
-# base pins under the LArTPC image.
+# base pins under the overlay images.
 if (( BASE_ARCHIVE )); then
-    update_latest "$(basename "$BASE_TAR")" "$IMAGES_DIR/t1-base-${VARIANT}-latest.oci.tar"
+    update_latest "t1-base-${VARIANT}-${TAG}.oci.tar" "$IMAGES_DIR/t1-base-${VARIANT}-latest.oci.tar"
 fi
-write_manifest "$IMAGES_DIR/t1-base-${VARIANT}-${TAG}.manifest.json" "$BASE_ARGFILE"
+write_manifest "$IMAGES_DIR/t1-base-${VARIANT}-${TAG}.manifest.json" "${ARGFILES[base]}"
 
-update_latest "$(basename "$LARTPC_TAR")" "$IMAGES_DIR/t1-lartpc-${VARIANT}-latest.oci.tar"
-if (( BUILD_SIF )); then
-    update_latest "$(basename "$LARTPC_SIF")" "$IMAGES_DIR/t1-lartpc-${VARIANT}-latest.sif"
-fi
-write_manifest "$IMAGES_DIR/t1-lartpc-${VARIANT}-${TAG}.manifest.json" "$LARTPC_ARGFILE"
+for sub in "${SELECTED[@]}"; do
+    update_latest "t1-$sub-${VARIANT}-${TAG}.oci.tar" "$IMAGES_DIR/t1-$sub-${VARIANT}-latest.oci.tar"
+    if (( BUILD_SIF )); then
+        update_latest "t1-$sub-${VARIANT}-${TAG}.sif" "$IMAGES_DIR/t1-$sub-${VARIANT}-latest.sif"
+    fi
+    write_manifest "$IMAGES_DIR/t1-$sub-${VARIANT}-${TAG}.manifest.json" "${ARGFILES[$sub]}"
+done
 
 DONE_FILES=()
 for f in "${OUTPUTS[@]}"; do DONE_FILES+=("$(basename "$f")"); done

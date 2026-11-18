@@ -9,6 +9,7 @@ container build.
 """
 import json
 import os
+import shutil
 import subprocess
 import tempfile
 import textwrap
@@ -105,7 +106,7 @@ class BuildShTest(unittest.TestCase):
         r = self.run_build("--help")
         self.assertEqual(r.returncode, 0, r.stderr)
         for opt in ["--variant", "--work-dir", "--images-dir", "--cache-dir", "--pin",
-                    "--tag", "--no-sif", "--no-pipeline-test", "--gpu",
+                    "--subgroup", "--tag", "--no-sif", "--no-pipeline-test", "--gpu",
                     "--squashfs-mem", "--help"]:
             self.assertIn(opt, r.stdout)
 
@@ -139,6 +140,8 @@ class BuildShTest(unittest.TestCase):
             "t1-base-cuda12-t1.oci.tar", "t1-lartpc-cuda12-t1.oci.tar",
             "t1-base-cuda12-t1.manifest.json", "t1-lartpc-cuda12-t1.manifest.json",
             "t1-base-cuda12-latest.oci.tar", "t1-lartpc-cuda12-latest.oci.tar",
+            "t1-wc-cuda12-t1.oci.tar", "t1-wc-cuda12-t1.manifest.json",
+            "t1-wc-cuda12-latest.oci.tar",
         ]))
         m = self.manifest("lartpc", "t1")
         self.assertEqual(m["pins"]["goop_commit"], "abc123")
@@ -169,7 +172,10 @@ class BuildShTest(unittest.TestCase):
         self.assertEqual(names, {
             "t1-lartpc-cuda12-t5.oci.tar", "t1-lartpc-cuda12-t5.sif",
             "t1-lartpc-cuda12-latest.oci.tar", "t1-lartpc-cuda12-latest.sif",
-            "t1-lartpc-cuda12-t5.manifest.json", "t1-base-cuda12-t5.manifest.json"})
+            "t1-lartpc-cuda12-t5.manifest.json", "t1-base-cuda12-t5.manifest.json",
+            "t1-wc-cuda12-t5.oci.tar", "t1-wc-cuda12-t5.sif",
+            "t1-wc-cuda12-latest.oci.tar", "t1-wc-cuda12-latest.sif",
+            "t1-wc-cuda12-t5.manifest.json"})
         self.assertIn("/opt/t1-base-tests/image-test.sh", self.calls("podman"))
         self.assertEqual(self.run_build("--no-base-archive=1").returncode, 2)
 
@@ -185,6 +191,71 @@ class BuildShTest(unittest.TestCase):
         r = self.run_build("--squashfs-mem", "3G", "--tag", "t3", "--no-pipeline-test")
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("-mem 3G", self.calls("apptainer"))
+
+    def test_default_builds_all_subgroups(self):
+        r = self.run_build("--tag", "t6", "--no-pipeline-test")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        names = {p.name for p in self.img.iterdir()}
+        for sub in ("lartpc", "wc"):
+            for suffix in ("t6.oci.tar", "t6.sif", "t6.manifest.json",
+                           "latest.oci.tar", "latest.sif"):
+                self.assertIn(f"t1-{sub}-cuda12-{suffix}", names)
+        expected = {k.lower(): v for k, v in
+                    env_lines(REPO / "subgroups/wc/versions.env").items()}
+        self.assertEqual(self.manifest("wc", "t6")["pins"], expected)
+        self.assertIn("/opt/t1-wc-tests/image-test.sh", self.calls("podman"))
+        self.assertIn("t1-wc-cuda12-t6.sif bash /opt/t1-base-tests/image-test.sh",
+                      self.calls("apptainer"))
+
+    def test_subgroup_wc_only(self):
+        r = self.run_build("--subgroup", "wc", "--tag", "t7")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        names = {p.name for p in self.img.iterdir()}
+        self.assertFalse([n for n in names if "lartpc" in n], names)
+        self.assertTrue({
+            "t1-wc-cuda12-t7.oci.tar", "t1-wc-cuda12-t7.sif", "t1-wc-cuda12-t7.manifest.json",
+            "t1-wc-cuda12-latest.oci.tar", "t1-wc-cuda12-latest.sif",
+            "t1-base-cuda12-t7.oci.tar", "t1-base-cuda12-t7.manifest.json"} <= names, names)
+        self.assertIn("== dprod full-chain test: skipped (lartpc not selected) ==", r.stdout)
+        self.assertNotIn("subgroups/lartpc/Containerfile", self.calls("podman"))
+
+    def test_pin_wc(self):
+        r = self.run_build("--subgroup", "wc", "--pin", "LUCID_COMMIT=deadbeef",
+                           "--tag", "t8", "--no-sif")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        wc_args = (self.tmp / "argfile-2").read_text().splitlines()
+        self.assertEqual([l for l in wc_args if l.startswith("LUCID_COMMIT=")],
+                         ["LUCID_COMMIT=deadbeef"])
+        wc_build = [l for l in self.calls("podman").splitlines()
+                    if "-f subgroups/wc/Containerfile" in l]
+        self.assertEqual(len(wc_build), 1)
+        self.assertIn("--build-arg BASE_IMAGE=localhost/t1-base-cuda12:t8", wc_build[0])
+        self.assertEqual(self.manifest("wc", "t8")["pins"]["lucid_commit"], "deadbeef")
+
+    def test_pin_unselected_subgroup_accepted(self):
+        r = self.run_build("--subgroup", "wc", "--pin", "GOOP_COMMIT=x", "--tag", "t9", "--no-sif")
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+    def test_unknown_subgroup(self):
+        r = self.run_build("--subgroup", "nope")
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("unknown subgroup 'nope'", r.stderr)
+        self.assertIsNone(self.calls("podman"))
+
+    def test_pin_in_two_files(self):
+        copy = self.tmp / "repo"
+        for d in ("scripts", "base", "subgroups"):
+            shutil.copytree(REPO / d, copy / d)
+        with open(copy / "subgroups/wc/versions.env", "a") as f:
+            f.write("GOOP_COMMIT=y\n")
+        env = dict(os.environ, PATH=f"{self.tmp / 'bin'}:/usr/bin:/bin", FAKE_ROOT=str(self.tmp))
+        r = subprocess.run([str(copy / "scripts/build.sh"), "--work-dir", str(self.tmp / "w"),
+                            "--images-dir", str(self.img), "--pin", "GOOP_COMMIT=z"],
+                           env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                           universal_newlines=True)
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("is in more than one versions.env file", r.stderr)
+        self.assertIsNone(self.calls("podman"))
 
 
 if __name__ == "__main__":
