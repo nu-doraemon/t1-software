@@ -1,0 +1,105 @@
+# t1-wc -- water-Cherenkov subgroup overlay on top of t1-base. Adds
+# LUCiD (differentiable optical-photon simulation, calibration and
+# reconstruction, JAX) and PhotonSim (the Geant4 optical-photon
+# application LUCiD's production chain, lucid-run-job, runs as a
+# subprocess). LUCiD installs into the base image's single /opt/conda
+# python3 next to Torch/JAX/PyROOT; PhotonSim gets its own Geant4 11.3
+# prefix, /opt/photonsim-g4 (see below).
+#
+# Not included: GENIE (no LUCiD production config shipped at the pinned
+# commit uses `primary_source: genie`; particle-gun and supernova
+# configs need only PhotonSim), and LUCiD's SIREN example data
+# (scripts/download_data.sh in the LUCiD checkout fetches it on the host;
+# the LUCiD tests that need it skip).
+#
+# One RUN per pinned unit, each preceded by its own ARG, so bumping one
+# pin rebuilds only that step and the steps after it. The units that
+# change least sit first.
+#
+# Build context is the repository root:
+#   podman build --build-arg-file <versions.env without comments> \
+#       --build-arg BASE_IMAGE=localhost/t1-base-cuda12:<tag> \
+#       -f subgroups/wc/Containerfile -t t1-wc-cuda12:<tag> .
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends git \
+ && rm -rf /var/lib/apt/lists/*
+
+# Record what the base ships before this overlay installs anything:
+# - base-constraints.txt pins the base-owned Python packages for every
+#   pip step below (`pip install -c`), so pip fails rather than replacing
+#   the base's Torch/JAX/NumPy. importlib.metadata, not `pip freeze`:
+#   freeze prints conda-installed packages as `name @ file://...`, which
+#   pip rejects as a constraint.
+# - base-g4root-versions lets tests/image-test.sh prove that the base's
+#   Geant4 and ROOT are still the ones in /opt/conda.
+RUN mkdir -p /opt/t1-wc \
+ && python3 -c "import importlib.metadata as m; \
+print('\n'.join(f'{p}=={m.version(p)}' for p in ('torch', 'jax', 'jaxlib', 'numpy', 'scipy', 'h5py')))" \
+        > /opt/t1-wc/base-constraints.txt \
+ && printf 'geant4=%s\nroot=%s\n' "$(geant4-config --version)" "$(root-config --version)" \
+        > /opt/t1-wc/base-g4root-versions \
+ && test "$(wc -l < /opt/t1-wc/base-constraints.txt)" -eq 6 \
+ && test "$(wc -l < /opt/t1-wc/base-g4root-versions)" -eq 2 \
+ && cat /opt/t1-wc/base-constraints.txt /opt/t1-wc/base-g4root-versions
+
+# LUCiD's non-JAX dependencies from conda-forge into the shared prefix
+# (--freeze-installed keeps the base pins untouched). ipython and
+# imageio are imported by LUCiD (lucid/utils.py, siren/training/
+# monitor.py, visualization.py) but not declared in its pyproject;
+# without ipython most of its test modules fail to import. flax/optax
+# come from pip in the LUCiD step: conda-forge flax would pull a conda jax.
+RUN micromamba install -y -p /opt/conda -c conda-forge --override-channels \
+        --freeze-installed seaborn uproot awkward plotly matplotlib tqdm \
+        pytest ipython imageio \
+ && micromamba clean -y -a
+
+# PhotonSim's sidecar prefix. PhotonSim calls G4RunManagerFactory, which
+# exists only from Geant4 11.0, while the shared base stays on Geant4
+# 10.7 because the LArTPC overlay's edep-sim fork does not build on
+# 11.x. The sidecar carries its own Geant4, ROOT (PhotonSim writes ROOT
+# files; one process must not mix two prefixes' libraries) and GCC.
+# Nothing in the image's ENV points here; only the PhotonSim wrapper does.
+ARG PHOTONSIM_GEANT4_VERSION
+ARG PHOTONSIM_GEANT4_BUILD_VARIANT
+ARG PHOTONSIM_ROOT_VERSION
+ARG PHOTONSIM_GXX_VERSION
+RUN micromamba create -y -p /opt/photonsim-g4 -c conda-forge --override-channels \
+        "geant4=${PHOTONSIM_GEANT4_VERSION}=${PHOTONSIM_GEANT4_BUILD_VARIANT}" \
+        "root_base=${PHOTONSIM_ROOT_VERSION}" \
+        "gxx_linux-64=${PHOTONSIM_GXX_VERSION}" \
+        "cmake<4" make expat \
+ && micromamba clean -y -a \
+ && echo "${PHOTONSIM_GEANT4_VERSION}" > /opt/t1-wc/photonsim-geant4-version
+
+# PhotonSim, built against the sidecar only (see build/build-photonsim.sh),
+# plus its wrapper at $PHOTONSIM_BIN, which gives the process the
+# sidecar's Geant4 data, ROOTSYS and sysroot.
+ARG PHOTONSIM_REPO
+ARG PHOTONSIM_COMMIT
+COPY subgroups/wc/build/build-photonsim.sh /tmp/build-photonsim.sh
+COPY subgroups/wc/runtime/photonsim /tmp/photonsim-wrapper
+RUN bash /tmp/build-photonsim.sh && rm /tmp/build-photonsim.sh /tmp/photonsim-wrapper
+
+# LUCiD, editable: it reads config/ and data/ relative to its package
+# directory, so the checkout stays at /opt/LUCiD. The clone keeps its
+# history, so setuptools-scm derives LUCiD's version itself. The
+# constraints file holds the base's Torch/JAX/NumPy/SciPy/h5py at their
+# installed versions: pip resolves flax/optax against them or fails.
+ARG LUCID_REPO
+ARG LUCID_COMMIT
+RUN git clone --quiet "${LUCID_REPO}" /opt/LUCiD \
+ && git -C /opt/LUCiD checkout --quiet "${LUCID_COMMIT}" \
+ && python3 -m pip install --no-cache-dir -c /opt/t1-wc/base-constraints.txt -e /opt/LUCiD
+
+# lucid-run-job finds PhotonSim through this variable.
+ENV PHOTONSIM_BIN=/opt/PhotonSim/bin/photonsim
+
+COPY subgroups/wc/tests/ /opt/t1-wc-tests/
+
+# The conda installs above may have added activate.d hooks to /opt/conda.
+RUN /opt/t1-runtime/check-env.sh
+
+WORKDIR /

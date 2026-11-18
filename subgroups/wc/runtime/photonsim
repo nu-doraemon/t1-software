@@ -1,0 +1,21 @@
+#!/bin/bash
+# Run PhotonSim with its own Geant4 11.3 / ROOT prefix (/opt/photonsim-g4).
+#
+# The image's static ENV belongs to the shared base: its G4*DATA point at
+# the base's Geant4 10.7 datasets, ROOTSYS at the base's ROOT, and
+# CONDA_BUILD_SYSROOT at the base's sysroot. PhotonSim links the sidecar
+# prefix instead, so this wrapper points those variables at the sidecar
+# for this one process and leaves everything else in the image alone.
+# lucid-run-job starts $PHOTONSIM_BIN with subprocess.call, which passes
+# this environment on to PhotonSim.
+#
+# /opt/photonsim-g4/g4data/<VAR> are version-free links to the sidecar's
+# dataset directories, made at build time from the sidecar's own
+# geant4-data activate hooks, so a Geant4 pin bump needs no edit here.
+set -euo pipefail
+for d in /opt/photonsim-g4/g4data/*; do
+    export "$(basename "$d")=$d"
+done
+export ROOTSYS=/opt/photonsim-g4
+export CONDA_BUILD_SYSROOT=/opt/photonsim-g4/x86_64-conda-linux-gnu/sysroot
+exec /opt/PhotonSim/build/PhotonSim "$@"
