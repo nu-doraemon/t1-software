@@ -6,6 +6,9 @@
 # image too, separately.
 set -euo pipefail
 [ "$(command -v python3)" = /opt/conda/bin/python3 ]
+# apptainer passes the host's TMPDIR through; LUCiD's shell-script tests
+# (mktemp) fail when that directory does not exist inside the container.
+[ -d "${TMPDIR:-/tmp}" ] || export TMPDIR=/tmp
 
 echo "== base packages unchanged; LUCiD imports =="
 python3 - <<'EOF'
