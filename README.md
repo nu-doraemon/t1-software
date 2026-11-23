@@ -179,6 +179,9 @@ S3DF, keeps a ledger of every build, and renders a static dashboard. It
 calls `build.sh` with `--pin` and `--tag` and never edits this repo. See
 `sites/s3df/README.md`; another site can copy that directory.
 
+Dashboard of the S3DF builds:
+<https://s3df.slac.stanford.edu/data/neutrino/t1-software/index.html>
+
 ## Using the images
 
 ```bash
@@ -193,7 +196,7 @@ podman run --rm localhost/t1-lartpc-cuda12:<tag> python3 ...
 - **LUCiD** is an editable checkout at `/opt/LUCiD` (it reads `config/`
   and `data/` next to its package), installed into `/opt/conda` with the
   base's Torch/JAX/NumPy/SciPy/h5py held at their base versions. LUCiD
-  supports only `jax>=0.5.3,<0.6`, which is why the base pins JAX 0.5.3.
+  supports only `jax>=0.6.2,<0.7`; the base pins JAX 0.6.2.
   Its PMT overlap tables for the shipped `*_WAND` detectors are built
   into the image.
 - **`/opt/VERSIONS`** records the LUCiD and PhotonSim commits and tags
