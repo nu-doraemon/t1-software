@@ -1,5 +1,8 @@
 # t1-software
 
+**Releases and nightly builds (S3DF dashboard):**
+<https://s3df.slac.stanford.edu/data/neutrino/t1-software/index.html>
+
 T1 public data-challenge containers (T1-FM foundation-models thrust):
 t1-lartpc (LArTPC) and t1-wc (water Cherenkov).
 
@@ -182,9 +185,6 @@ repo. It also converts the upstream t1-wc release image (LUCiD's
 `ghcr.io/cider-ml/lucid`) to Apptainer for other HPC sites and keeps the
 newest 3 releases. See `sites/s3df/README.md`; another site can copy
 that directory.
-
-Dashboard of the S3DF builds:
-<https://s3df.slac.stanford.edu/data/neutrino/t1-software/index.html>
 
 ## Using the images
 
