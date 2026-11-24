@@ -41,6 +41,18 @@ assert len(ps["photonsim_commit"]) == 40, ps
 assert "unknown" not in (ps["photonsim_ref"], ps["geant4_version"]), ps
 EOF
 
+# With a GPU (apptainer --nv), LUCiD's JAX must run on it: the seam test
+# below then runs LUCiD on the GPU. Without one (podman here, or a CPU
+# node) the seam runs on the CPU.
+echo "== JAX backend =="
+if nvidia-smi -L > /dev/null 2>&1; then
+    python3 -c "import jax, jax.numpy as jnp; b = jax.default_backend(); \
+print('jax backend', b, jax.devices()); assert b == 'gpu', b; \
+x = jnp.ones((256, 256)); assert float((x @ x).sum()) == 256.0 ** 3"
+else
+    echo "no GPU: the seam test runs LUCiD on the CPU"
+fi
+
 echo "== PhotonSim -> LUCiD seam =="
 bash /opt/t1-wc-tests/test_photonsim_lucid.sh
 

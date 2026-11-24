@@ -3,39 +3,59 @@
 # requires-python = ">=3.11"
 # dependencies = []
 # ///
-"""Nightly HEAD builds of t1-software on S3DF.
+"""Nightly HEAD builds of t1-software on S3DF, and Apptainer copies of
+upstream release images.
 
 Two layers do the work. scripts/build.sh is the generic layer: it builds
 one commit set and knows nothing about the nightly. This script is the
-site layer. Once a day, cron runs `poll` on the cron node. `poll` resolves
-the HEAD of t1-software and of every package that has a <PKG>_REPO key in
-versions.env. The commit set gives a build key. A key that is new to the
-ledger gets one Slurm job, which runs `run` on a GPU node. `run` fetches
-t1-software at the recorded commit into a scratch clone and calls
-build.sh with --pin and --tag. No t1-software checkout is ever modified.
+site layer. Once a day, cron runs `poll` on the cron node.
+
+Nightly builds. `poll` resolves the HEAD of t1-software and of every
+package that has a <PKG>_REPO key in versions.env. Each subgroup overlay
+(lartpc, wc) has its own build key, from the variant, the t1-software
+commit, the base pins and that subgroup's own pins. So a package change
+rebuilds only the subgroup that uses it. Every subgroup key that is new
+to the ledger gets a record; one Slurm job then runs `run KEY...` on a
+GPU node. `run` builds the records one after another, in SUBGROUPS
+order: it fetches t1-software at the recorded commit into a scratch
+clone and calls build.sh with --subgroup, --pin and --tag. A failed
+subgroup never stops the next one. No t1-software checkout is modified.
+
+Releases. For each subgroup in RELEASE_SUBGROUPS, `poll` lists the
+release tags (vX.Y.Z) of that subgroup's upstream image (RELEASES). The
+newest RELEASE_KEEP tags that have no record get one CPU Slurm job,
+which runs `convert SUBGROUP/TAG...`: apptainer pull of the image at
+its digest, an inspection, the subgroup's release test inside the
+image, a sha256 file, and the <name>-latest.sif link.
 
 Ledger, under the state directory (--state or $T1_NIGHTLY_STATE):
 
-    site.env                      site values (paths, Slurm account, ...)
-    last-poll.json                {time, ok, error, heads}
-    poll.log                      one line per poll decision
-    t1-software.git/              bare cache, used to read versions.env
-    builds/<key>/record.json      one record per commit set
-    builds/<key>/build.log        latest attempt; attempt-N.log for earlier
-    builds/<key>/review.json      written only by `review`
+    site.env                         site values (paths, Slurm account, ...)
+    last-poll.json                   {time, ok, error, heads}
+    last-release-check.json          {time, ok, error}
+    poll.log                         one line per poll decision
+    t1-software.git/                 bare cache, used to read versions.env
+    jobs/<jobid>.log                 Slurm output of each job
+    builds/<key>/record.json         one record per subgroup commit set
+    builds/<key>/build.log           latest attempt; attempt-N.log for earlier
+    builds/<key>/review.json         written only by `review`
+    releases/<sub>/<tag>/record.json one record per converted release
+    releases/<sub>/<tag>/convert.log latest attempt; attempt-N.log for earlier
 
-Statuses:
+Statuses (builds and releases):
 
     queued       poll/retry, after sbatch succeeds
-    running      run, at job start
-    success      run, build.sh exit 0
-    failed       run, build.sh exit != 0; or poll, from sacct
+    running      run/convert, at the start of that record
+    success      run: build.sh exit 0; convert: every step passed
+    failed       run/convert, a step failed; or poll, from sacct
     interrupted  poll, on PREEMPTED, TIMEOUT or NODE_FAIL; poll resubmits
-                 it once, then it waits for `retry`
+                 a build once, then it waits for `retry`
     cancelled    poll, on CANCELLED; waits for `retry`
 
-A key that has a record is never built again automatically, whatever its
-status. Only `retry` rebuilds it. At most one build is queued or running.
+A key or a release tag that has a record is never built again
+automatically, whatever its status. Only `retry` and `retry-release`
+rebuild it. At most one build job and one conversion job are queued or
+running.
 """
 import argparse
 import contextlib
@@ -49,6 +69,9 @@ import shutil
 import signal
 import subprocess
 import sys
+import urllib.error
+import urllib.parse
+import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -56,14 +79,33 @@ import dashboard  # sites/s3df/dashboard.py; a script's own directory is on sys.
 
 T1 = "T1_SOFTWARE_COMMIT"
 ACTIVE = ("queued", "running")
-# Subgroup overlays build.sh builds by default; each gets its own
-# t1-<subgroup>-<variant>-nightly.sif link after a successful build.
+# Subgroup overlays, in build order. Each has its own build records and
+# its own t1-<subgroup>-<variant>-nightly.sif link.
 SUBGROUPS = ("lartpc", "wc")
 RETRYABLE = ("failed", "interrupted", "cancelled")
 SLURM_ALIVE = {"PENDING", "RUNNING", "REQUEUED", "SUSPENDED", "CONFIGURING",
                "COMPLETING", "RESIZING"}
 SLURM_INTERRUPT = {"PREEMPTED", "TIMEOUT", "NODE_FAIL"}
 GIT_TIMEOUT = 120  # s; one ls-remote or shallow fetch takes a few seconds
+REGISTRY_TIMEOUT = 60  # s per registry request
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
+# Upstream release images, per subgroup, that RELEASE_SUBGROUPS converts:
+#   image   public OCI image; its vX.Y.Z tags are the releases
+#   repo    source repository, for the release, recipe and package links
+#   recipe  the image recipe's directory in repo
+#   test    script in this repository, run inside the converted image
+#           (apptainer exec IMAGE bash -s < test)
+RELEASES = {
+    "wc": {"image": "ghcr.io/cider-ml/lucid", "repo": "https://github.com/CIDeR-ML/LUCiD",
+           "recipe": "container", "test": "subgroups/wc/tests/test_photonsim_lucid.sh"},
+}
+RELEASE_TAG = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)$")
+MANIFEST_ACCEPT = ", ".join([
+    "application/vnd.oci.image.index.v1+json",
+    "application/vnd.docker.distribution.manifest.list.v2+json",
+    "application/vnd.oci.image.manifest.v1+json",
+    "application/vnd.docker.distribution.manifest.v2+json"])
 
 # site.env keys. None means: required (REQUIRED) or computed in load_site.
 SITE_DEFAULTS = {
@@ -84,6 +126,13 @@ SITE_DEFAULTS = {
     "SLURM_CPUS": "8",
     "SLURM_MEM": "32G",
     "SLURM_TIME": "16:00:00",
+    "RELEASE_SUBGROUPS": "",
+    "RELEASE_KEEP": "3",
+    "CONVERT_PARTITION": "milano",
+    "CONVERT_GPUS": "0",
+    "CONVERT_CPUS": "8",
+    "CONVERT_MEM": "32G",
+    "CONVERT_TIME": "02:00:00",
     "SBATCH": "sbatch",
     "SACCT": "sacct",
     "APPTAINER": "apptainer",
@@ -98,7 +147,7 @@ class UsageError(Exception):
 
 
 class PollError(Exception):
-    """A HEAD lookup failed; the poll submits nothing."""
+    """A HEAD or registry lookup failed; the poll submits nothing for it."""
 
 
 class SubmitError(Exception):
@@ -107,6 +156,10 @@ class SubmitError(Exception):
 
 class SacctError(Exception):
     """sacct failed."""
+
+
+class StepError(Exception):
+    """A conversion step failed; the message is the step name."""
 
 
 def now_iso():
@@ -142,6 +195,10 @@ def load_site(state):
     for key in REQUIRED:
         if not site[key]:
             raise UsageError(f"site.env: {key} is required")
+    for sub in release_subgroups(site):
+        if sub not in RELEASES:
+            raise UsageError(f"site.env: RELEASE_SUBGROUPS: no release image for {sub} "
+                             f"(known: {', '.join(sorted(RELEASES))})")
     if not site["DASHBOARD_DIR"]:
         site["DASHBOARD_DIR"] = str(state / "site")
     # uv sets $UV to its own path for the scripts it runs. Cron's PATH
@@ -151,6 +208,10 @@ def load_site(state):
         raise UsageError("site.env: UV not found")
     site["UV"] = os.path.abspath(uv)
     return site
+
+
+def release_subgroups(site):
+    return [s.strip() for s in site["RELEASE_SUBGROUPS"].split(",") if s.strip()]
 
 
 def load_json(path):
@@ -180,9 +241,9 @@ def ledger_lock(state):
             fcntl.flock(f, fcntl.LOCK_UN)
 
 
-def build_key(variant, t1_commit, pins):
-    blob = json.dumps({"variant": variant, "t1_software_commit": t1_commit, "pins": pins},
-                      sort_keys=True, separators=(",", ":"))
+def build_key(variant, t1_commit, pins, subgroup):
+    blob = json.dumps({"variant": variant, "t1_software_commit": t1_commit, "pins": pins,
+                       "subgroup": subgroup}, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(blob.encode()).hexdigest()[:12]
 
 
@@ -195,22 +256,28 @@ def record_path(state, key):
 
 
 def _order(record):
-    """Sort key: queued_at, then the last Slurm job id.
+    """Sort key: queued_at, then the last Slurm job id, then SUBGROUPS order.
 
     queued_at has one-second resolution, so two records can tie. Slurm job
-    ids grow monotonically, which breaks the tie.
+    ids grow monotonically, which breaks the tie; records of one job keep
+    their build order.
     """
     ids = record.get("slurm_job_ids") or []
     last = int(ids[-1]) if ids and str(ids[-1]).isdigit() else -1
-    return (record.get("queued_at") or "", last)
+    sub = record.get("subgroup")
+    rank = -SUBGROUPS.index(sub) if sub in SUBGROUPS else -len(SUBGROUPS)
+    return (record.get("queued_at") or "", last, rank)
 
 
 def load_records(state):
-    """All records, newest first (see _order)."""
+    """All build records, newest first (see _order). A record from before
+    per-subgroup builds has no subgroup; those built only t1-lartpc.
+    """
     records = []
     for path in (state / "builds").glob("*/record.json"):
         rec = load_json(path)
         if rec is not None:
+            rec.setdefault("subgroup", "lartpc")
             records.append(rec)
     records.sort(key=_order, reverse=True)
     return records
@@ -258,8 +325,13 @@ def ls_remote(repo, ref):
 
 
 def resolve_heads(state, site):
-    """HEADs and clone URLs of t1-software and of every package with a
-    <PKG>_REPO key. Returns (heads, repos), both keyed by <PKG>_COMMIT.
+    """HEADs of t1-software and of every tracked package, at the HEAD of
+    T1_SOFTWARE_BRANCH.
+
+    Returns (heads, repos, owners, subgroups). heads and repos are keyed by
+    <PKG>_COMMIT; owners maps each package key to "base" or the subgroup
+    whose versions.env names it; subgroups lists the SUBGROUPS present at
+    that commit, in build order.
     """
     repo, branch = site["T1_SOFTWARE_REPO"], site["T1_SOFTWARE_BRANCH"]
     commit = ls_remote(repo, f"refs/heads/{branch}")
@@ -267,16 +339,16 @@ def resolve_heads(state, site):
     if not cache.exists():
         git("init", "--bare", "--quiet", str(cache))
     git("-C", str(cache), "fetch", "--quiet", "--depth", "1", repo, commit)
-    paths = ["base/versions.env"]
-    for line in git("-C", str(cache), "ls-tree", "--name-only", commit, "subgroups/").splitlines():
-        paths.append(f"{line}/versions.env")
-    heads = {T1: commit}
-    repos = {T1: repo}
-    for path in paths:
+    present = {line.rsplit("/", 1)[-1] for line in
+               git("-C", str(cache), "ls-tree", "--name-only", commit, "subgroups/").splitlines()}
+    subgroups = [s for s in SUBGROUPS if s in present]
+    heads, repos, owners = {T1: commit}, {T1: repo}, {}
+    for path, owner in [("base/versions.env", "base"),
+                        *((f"subgroups/{s}/versions.env", s) for s in subgroups)]:
         try:
             text = git("-C", str(cache), "show", f"{commit}:{path}")
         except PollError:
-            if path == "base/versions.env":
+            if owner == "base":
                 raise
             continue  # a subgroup without its own pins
         pins = parse_kv(text)
@@ -285,7 +357,13 @@ def resolve_heads(state, site):
                 url = pins[key[: -len("_COMMIT")] + "_REPO"]
                 heads[key] = ls_remote(url, "HEAD")
                 repos[key] = url
-    return heads, repos
+                owners[key] = owner
+    return heads, repos, owners, subgroups
+
+
+def subgroup_pins(heads, owners, subgroup):
+    """The pins one subgroup's build uses: the base's and its own."""
+    return {k: v for k, v in heads.items() if k != T1 and owners.get(k) in ("base", subgroup)}
 
 
 def nightly_link(site, variant, subgroup):
@@ -293,25 +371,28 @@ def nightly_link(site, variant, subgroup):
     return Path(site["IMAGES_DIR"]) / f"t1-{subgroup}-{variant}-nightly.sif"
 
 
-def update_nightly_link(site, rec, subgroup):
-    """Point the subgroup's nightly_link at rec's .sif with a relative
-    target. Returns False when the image file is missing or the link
-    cannot be written.
-    """
-    sif = Path(rec["images_dir"]) / f"t1-{subgroup}-{rec['variant']}-{rec['tag']}.sif"
-    link = nightly_link(site, rec["variant"], subgroup)
-    if not sif.is_file():
-        return False
+def replace_link(link, target):
+    """Point link at target with a relative path, atomically. Returns success."""
     tmp = link.with_name(f".{link.name}.tmp.{os.getpid()}")
     try:
         tmp.unlink(missing_ok=True)
-        tmp.symlink_to(os.path.relpath(sif, link.parent))
+        tmp.symlink_to(os.path.relpath(target, link.parent))
         os.replace(tmp, link)
     except OSError as e:
         print(f"nightly: cannot update {link}: {e}", file=sys.stderr, flush=True)
         tmp.unlink(missing_ok=True)
         return False
     return True
+
+
+def update_nightly_link(site, rec):
+    """Point the record's subgroup nightly_link at its .sif. Returns False
+    when the image file is missing or the link cannot be written.
+    """
+    sif = dashboard.image_file(rec)
+    if not sif.is_file():
+        return False
+    return replace_link(nightly_link(site, rec["variant"], rec["subgroup"]), sif)
 
 
 def _pip_version(pip, prefix):
@@ -326,10 +407,13 @@ def _differs(pinned, installed):
 
 
 def compose_image_info(raw, base_pins, size, built_at, sif):
-    """Core-stack rows (pinned vs installed) and the package list of one image.
+    """Core-stack rows (pinned vs installed), provenance and the package
+    list of one image.
 
     raw is the output of image_info.py; base_pins is the base manifest's
-    pins. A pin of "3.11" matches an installed "3.11.17".
+    pins ({} for an image not built here). A pin of "3.11" matches an
+    installed "3.11.17". jax_gpu: the image's JAX has a CUDA backend
+    (a jax-cuda* plugin, or a CUDA build of conda's jaxlib).
     """
     pip = dict(raw["pip"])
     conda = raw["conda"]
@@ -338,7 +422,7 @@ def compose_image_info(raw, base_pins, size, built_at, sif):
         ("OS", "", raw["os"], raw["os"], ""),
         ("Python", "python_version", raw["python"], raw["python"], "conda-forge"),
         ("PyTorch", "torch_version", _pip_version(pip, "torch"), _pip_version(pip, "torch"), ""),
-        ("JAX", "jax_version", f"{jax} (jaxlib {_pip_version(pip, 'jaxlib')})", jax, ""),
+        ("JAX", "jax_version", f"{jax} (jaxlib {_pip_version(pip, 'jaxlib')})" if jax else "", jax, ""),
         ("CUDA runtime", "", _pip_version(pip, "nvidia-cuda-runtime"), "", "pip"),
         ("cuDNN", "", _pip_version(pip, "nvidia-cudnn"), "", "pip"),
         ("Triton", "", _pip_version(pip, "triton"), "", ""),
@@ -355,29 +439,37 @@ def compose_image_info(raw, base_pins, size, built_at, sif):
         pinned = base_pins.get(pin_key, "") if pin_key else ""
         core.append({"name": name, "pinned": pinned, "installed": shown or "-", "note": note,
                      "differs": _differs(pinned, compare)})
+    jax_gpu = (any(n.startswith("jax-cuda") for n in pip)
+               or "cuda" in (raw.get("conda_builds") or {}).get("jaxlib", ""))
     return {"core": core, "pip": raw["pip"], "conda_count": len(conda), "size": size,
-            "built_at": built_at, "sif": str(sif)}
+            "built_at": built_at, "sif": str(sif), "versions": raw.get("versions") or {},
+            "jax_gpu": jax_gpu}
+
+
+def inspect_image(site, sif):
+    """image_info.py's JSON for one .sif. Raises RuntimeError or ValueError."""
+    script = Path(__file__).with_name("image_info.py").read_text()
+    r = subprocess.run([site["APPTAINER"], "exec", str(sif), "python", "-"], input=script,
+                       capture_output=True, text=True, timeout=600)
+    if r.returncode != 0:
+        raise RuntimeError(r.stderr.strip()[-300:])
+    return json.loads(r.stdout)
 
 
 def write_image_info(state, site, rec):
-    """Inspect the built .sif and write builds/<key>/image-info.json. A failure
-    is reported and never changes the build result. Returns success.
+    """Inspect the record's .sif and write builds/<key>/image-info.json. A
+    failure is reported and never changes the build result. Returns success.
     """
     images = Path(rec["images_dir"])
-    sif = images / f"t1-lartpc-{rec['variant']}-{rec['tag']}.sif"
+    sif = dashboard.image_file(rec)
     if not sif.is_file():
         return False
     try:
-        script = Path(__file__).with_name("image_info.py").read_text()
-        r = subprocess.run([site["APPTAINER"], "exec", str(sif), "python", "-"], input=script,
-                           capture_output=True, text=True, timeout=300)
-        if r.returncode != 0:
-            raise RuntimeError(r.stderr.strip()[-300:])
-        raw = json.loads(r.stdout)
+        raw = inspect_image(site, sif)
         base = load_json(images / f"t1-base-{rec['variant']}-{rec['tag']}.manifest.json") or {}
-        lartpc = load_json(images / f"t1-lartpc-{rec['variant']}-{rec['tag']}.manifest.json") or {}
+        own = load_json(images / f"t1-{rec['subgroup']}-{rec['variant']}-{rec['tag']}.manifest.json") or {}
         info = compose_image_info(raw, base.get("pins") or {}, sif.stat().st_size,
-                                  lartpc.get("built_at"), sif)
+                                  own.get("built_at"), sif)
         write_json(build_dir(state, rec["key"]) / "image-info.json", info)
     except (OSError, ValueError, KeyError, RuntimeError, subprocess.SubprocessError) as e:
         print(f"nightly: image info failed: {e}", file=sys.stderr, flush=True)
@@ -399,28 +491,27 @@ def sacct_state(site, job_id):
     return lines[0].split()[0] if lines and lines[0].split() else ""
 
 
-def submit(state, site, record):
-    """sbatch one build job; returns its job id."""
+def sbatch(state, site, name, resources, command):
+    """Submit build.sbatch running `nightly.py <command...>`; returns the job id.
+
+    Each job's Slurm output goes to <state>/jobs/<jobid>.log; each record
+    writes its own log besides.
+    """
     state = state.resolve()
     here = Path(__file__).resolve()
-    key = record["key"]
+    (state / "jobs").mkdir(parents=True, exist_ok=True)
     cmd = [
         site["SBATCH"], "--parsable",
-        "--job-name", f"t1-nightly-{key}",
+        "--job-name", name,
         "--account", site["SLURM_ACCOUNT"],
-        "--partition", site["SLURM_PARTITION"],
-        "--qos", site["SLURM_QOS"],
-        "--gpus", site["SLURM_GPUS"],
-        "--cpus-per-task", site["SLURM_CPUS"],
-        "--mem", site["SLURM_MEM"],
-        "--time", site["SLURM_TIME"],
-        "--output", str(build_dir(state, key) / "build.log"),
+        *resources,
+        "--output", str(state / "jobs" / "%j.log"),
         "--open-mode", "append",
         # The poll owns retries; Slurm's own requeue would race it.
         "--no-requeue",
         "--export", "ALL",
         str(here.parent / "build.sbatch"),
-        site["UV"], str(here), "run", key, "--state", str(state),
+        site["UV"], str(here), *command, "--state", str(state),
     ]
     try:
         r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -432,39 +523,55 @@ def submit(state, site, record):
     return r.stdout.strip().split(";", 1)[0].strip()
 
 
-def resubmit(state, site, record):
-    """Submit a new attempt of an existing record. Returns the job id.
+def submit(state, site, records):
+    """One build job for the records, built in SUBGROUPS order."""
+    records = sorted(records, key=lambda r: SUBGROUPS.index(r["subgroup"]))
+    keys = [r["key"] for r in records]
+    resources = ["--partition", site["SLURM_PARTITION"], "--qos", site["SLURM_QOS"],
+                 "--gpus", site["SLURM_GPUS"], "--cpus-per-task", site["SLURM_CPUS"],
+                 "--mem", site["SLURM_MEM"], "--time", site["SLURM_TIME"]]
+    return sbatch(state, site, f"t1-nightly-{keys[0]}", resources, ["run", *keys])
 
-    On sbatch failure the record and its logs stay as they were.
+
+def rotate_log(directory, name, attempt):
+    """Move <name> to attempt-<attempt>.log; returns the undo, or None."""
+    current, old = directory / name, directory / f"attempt-{attempt}.log"
+    if not current.exists():
+        return None
+    os.replace(current, old)
+    return lambda: os.replace(old, current)
+
+
+def resubmit(state, site, records):
+    """Submit a new attempt of existing build records in one job. Returns
+    the job id. On sbatch failure the records and their logs stay as they were.
     """
-    d = build_dir(state, record["key"])
-    log_path = d / "build.log"
-    old = d / f"attempt-{record['attempts']}.log"
-    moved = log_path.exists()
-    if moved:
-        os.replace(log_path, old)
+    undo = [rotate_log(build_dir(state, r["key"]), "build.log", r["attempts"]) for r in records]
     try:
-        job_id = submit(state, site, record)
+        job_id = submit(state, site, records)
     except SubmitError:
-        if moved:
-            os.replace(old, log_path)
+        for u in undo:
+            if u:
+                u()
         raise
-    record.update(attempts=record["attempts"] + 1, status="queued", queued_at=now_iso(),
-                  started_at=None, finished_at=None, failed_stage=None)
-    record["slurm_job_ids"].append(job_id)
-    save_record(state, record)
+    for rec in records:
+        rec.update(attempts=rec["attempts"] + 1, status="queued", queued_at=now_iso(),
+                   started_at=None, finished_at=None, failed_stage=None)
+        rec["slurm_job_ids"].append(job_id)
+        save_record(state, rec)
     return job_id
 
 
-def new_record(site, key, heads, repos, changed):
+def new_record(site, subgroup, key, t1_commit, pins, repos, changed):
     queued_at = now_iso()
     return {
         "key": key,
+        "subgroup": subgroup,
         "variant": site["VARIANT"],
-        "t1_software_commit": heads[T1],
-        "pins": {k: v for k, v in heads.items() if k != T1},
+        "t1_software_commit": t1_commit,
+        "pins": pins,
         "changed": changed,
-        "repos": repos,
+        "repos": {k: v for k, v in repos.items() if k == T1 or k in pins},
         "status": "queued",
         "failed_stage": None,
         "attempts": 1,
@@ -477,7 +584,7 @@ def new_record(site, key, heads, repos, changed):
     }
 
 
-def reconcile(state, site, records, dry_run):
+def reconcile(state, site, records, dry_run, save, name):
     """Settle queued/running records whose Slurm job ended without a result."""
     for rec in records:
         if rec["status"] not in ACTIVE or not rec["slurm_job_ids"]:
@@ -485,7 +592,7 @@ def reconcile(state, site, records, dry_run):
         try:
             st = sacct_state(site, rec["slurm_job_ids"][-1])
         except SacctError as e:
-            log(state, f"sacct failed for {rec['key']}: {e}", dry_run=dry_run)
+            log(state, f"sacct failed for {name(rec)}: {e}", dry_run=dry_run)
             continue
         if not st or st in SLURM_ALIVE:
             continue
@@ -496,14 +603,14 @@ def reconcile(state, site, records, dry_run):
         else:
             new = "failed"
         if dry_run:
-            log(state, f"would reconcile {rec['key']}: {st} -> {new}", dry_run=True)
+            log(state, f"would reconcile {name(rec)}: {st} -> {new}", dry_run=True)
             continue
         rec["status"] = new
         if new == "failed" and rec["failed_stage"] is None:
             rec["failed_stage"] = f"slurm {st}"
         rec["finished_at"] = now_iso()
-        save_record(state, rec)
-        log(state, f"reconcile {rec['key']}: {st} -> {new}")
+        save(state, rec)
+        log(state, f"reconcile {name(rec)}: {st} -> {new}")
 
 
 def _poll(state, site, dry_run):
@@ -511,11 +618,11 @@ def _poll(state, site, dry_run):
     prev = load_json(state / "last-poll.json") or {}
     prev_heads = prev.get("heads") or {}
 
-    reconcile(state, site, records, dry_run)
+    reconcile(state, site, records, dry_run, save_record, lambda r: r["key"])
     active = [r for r in records if r["status"] in ACTIVE]
 
     try:
-        heads, repos = resolve_heads(state, site)
+        heads, repos, owners, subgroups = resolve_heads(state, site)
     except PollError as e:
         if not dry_run:
             write_json(state / "last-poll.json",
@@ -530,60 +637,410 @@ def _poll(state, site, dry_run):
     if not active:
         pending = [r for r in records if r["status"] == "interrupted" and r["attempts"] == 1]
         if pending:
-            rec = pending[0]
+            keys = " ".join(r["key"] for r in pending)
             if dry_run:
-                log(state, f"would auto-retry {rec['key']}", dry_run=True)
+                log(state, f"would auto-retry {keys}", dry_run=True)
             else:
                 try:
-                    job_id = resubmit(state, site, rec)
+                    job_id = resubmit(state, site, pending)
                 except SubmitError as e:
                     log(state, f"sbatch failed: {e}")
                     return 1
-                log(state, f"auto-retry {rec['key']} job {job_id}")
-            active = [rec]
+                log(state, f"auto-retry {keys} job {job_id}")
+            active = pending
 
     ok = {"time": now_iso(), "ok": True, "error": None, "heads": heads}
     if active:
         if not dry_run:
             write_json(state / "last-poll.json", ok)
-        log(state, f"build active: {active[0]['key']}", dry_run=dry_run)
+        log(state, f"build active: {' '.join(r['key'] for r in active)}", dry_run=dry_run)
         return 0
 
-    pins = {k: v for k, v in heads.items() if k != T1}
-    key = build_key(site["VARIANT"], heads[T1], pins)
-    if dry_run:
-        print(f"key {key}")
-    existing = load_json(record_path(state, key))
-    if existing is not None:
-        if heads == prev_heads:
-            log(state, "no change", dry_run=dry_run)
-        else:
-            log(state, f"already built {key} ({existing['status']})", dry_run=dry_run)
-    else:
-        changed = {n: [prev_heads.get(n), sha] for n, sha in heads.items()
-                   if prev_heads.get(n) != sha}
+    new, built = [], []
+    for sub in subgroups:
+        pins = subgroup_pins(heads, owners, sub)
+        key = build_key(site["VARIANT"], heads[T1], pins, sub)
         if dry_run:
-            log(state, f"would submit {key} changed {','.join(changed)}", dry_run=True)
-            return 0
-        rec = new_record(site, key, heads, repos, changed)
-        d = build_dir(state, key)
-        d.mkdir(parents=True, exist_ok=True)
-        save_record(state, rec)
+            print(f"key {sub} {key}")
+        existing = load_json(record_path(state, key))
+        if existing is not None:
+            built.append(f"{sub} {key} ({existing['status']})")
+            continue
+        changed = {n: [prev_heads.get(n), sha] for n, sha in [(T1, heads[T1]), *pins.items()]
+                   if prev_heads.get(n) != sha}
+        new.append(new_record(site, sub, key, heads[T1], pins, repos, changed))
+    if not new:
+        log(state, "no change" if heads == prev_heads else f"already built {', '.join(built)}",
+            dry_run=dry_run)
+    elif dry_run:
+        for rec in new:
+            log(state, f"would submit {rec['subgroup']} {rec['key']} "
+                       f"changed {','.join(rec['changed'])}", dry_run=True)
+        return 0
+    else:
+        for rec in new:
+            build_dir(state, rec["key"]).mkdir(parents=True, exist_ok=True)
+            save_record(state, rec)
         try:
-            job_id = submit(state, site, rec)
+            job_id = submit(state, site, new)
         except SubmitError as e:
-            shutil.rmtree(d, ignore_errors=True)
+            for rec in new:
+                shutil.rmtree(build_dir(state, rec["key"]), ignore_errors=True)
             log(state, f"sbatch failed: {e}")
             return 1
-        rec["slurm_job_ids"].append(job_id)
-        save_record(state, rec)
-        log(state, f"submitted {key} job {job_id} changed {','.join(changed)}")
+        for rec in new:
+            rec["slurm_job_ids"].append(job_id)
+            save_record(state, rec)
+            log(state, f"submitted {rec['subgroup']} {rec['key']} job {job_id} "
+                       f"changed {','.join(rec['changed'])}")
 
     if not dry_run:
         write_json(state / "last-poll.json", ok)
         prune(state, site)
     return 0
 
+
+# -- releases ------------------------------------------------------------
+
+def version_key(tag):
+    return tuple(int(x) for x in RELEASE_TAG.match(tag).groups())
+
+
+def release_dir(state, subgroup, tag):
+    return state / "releases" / subgroup / tag
+
+
+def release_ref(rec):
+    return f"{rec['subgroup']}/{rec['tag']}"
+
+
+def save_release(state, rec):
+    write_json(release_dir(state, rec["subgroup"], rec["tag"]) / "record.json", rec)
+
+
+def load_releases(state):
+    """All release records, newest version first within each subgroup."""
+    out = []
+    for path in (state / "releases").glob("*/*/record.json"):
+        rec = load_json(path)
+        if rec is not None:
+            out.append(rec)
+    out.sort(key=lambda r: (r["subgroup"], version_key(r["tag"])), reverse=True)
+    return out
+
+
+def release_link(site, subgroup):
+    """<IMAGES_DIR>/<name>-latest.sif, <name> being the image's last path part."""
+    name = RELEASES[subgroup]["image"].rsplit("/", 1)[-1]
+    return Path(site["IMAGES_DIR"]) / f"{name}-latest.sif"
+
+
+def release_files(site, subgroup, tag):
+    """(<IMAGES_DIR>/<name>/<name>-<tag>.sif, release_link)."""
+    link = release_link(site, subgroup)
+    name = link.name.removesuffix("-latest.sif")
+    return link.parent / name / f"{name}-{tag}.sif", link
+
+
+def _http(url, headers=None, method="GET"):
+    req = urllib.request.Request(url, headers=headers or {}, method=method)
+    return urllib.request.urlopen(req, timeout=REGISTRY_TIMEOUT)
+
+
+def _registry_auth(host, name):
+    """Headers for anonymous pull access, from the registry's Bearer challenge."""
+    try:
+        with _http(f"https://{host}/v2/"):
+            return {}
+    except urllib.error.HTTPError as e:
+        if e.code != 401:
+            raise
+        challenge = e.headers.get("WWW-Authenticate", "")
+    params = dict(re.findall(r'(\w+)="([^"]*)"', challenge))
+    query = urllib.parse.urlencode({"service": params.get("service", ""),
+                                    "scope": f"repository:{name}:pull"})
+    with _http(f"{params['realm']}?{query}") as r:
+        data = json.load(r)
+    return {"Authorization": f"Bearer {data.get('token') or data['access_token']}"}
+
+
+def registry_releases(image, keep):
+    """The newest `keep` release tags of a public image, newest first, as
+    [(tag, digest)]. Raises PollError.
+    """
+    host, name = image.split("/", 1)
+    try:
+        auth = _registry_auth(host, name)
+        with _http(f"https://{host}/v2/{name}/tags/list?n=10000", auth) as r:
+            tags = json.load(r).get("tags") or []
+        out = []
+        for tag in sorted((t for t in tags if RELEASE_TAG.match(t)), key=version_key,
+                          reverse=True)[:keep]:
+            with _http(f"https://{host}/v2/{name}/manifests/{tag}",
+                       {**auth, "Accept": MANIFEST_ACCEPT}, "HEAD") as r:
+                out.append((tag, r.headers["Docker-Content-Digest"]))
+    except (OSError, ValueError, KeyError) as e:  # URLError and HTTPError are OSErrors
+        raise PollError(f"{image}: {e}") from None
+    return out
+
+
+def submit_convert(state, site, records):
+    resources = ["--partition", site["CONVERT_PARTITION"], "--qos", site["SLURM_QOS"],
+                 "--cpus-per-task", site["CONVERT_CPUS"], "--mem", site["CONVERT_MEM"],
+                 "--time", site["CONVERT_TIME"]]
+    if site["CONVERT_GPUS"] != "0":
+        resources += ["--gpus", site["CONVERT_GPUS"]]
+    return sbatch(state, site, "t1-convert", resources,
+                  ["convert", *(release_ref(r) for r in records)])
+
+
+def _poll_releases(state, site, dry_run):
+    subgroups = release_subgroups(site)
+    if not subgroups:
+        return 0
+    records = load_releases(state)
+    reconcile(state, site, records, dry_run, save_release, release_ref)
+    active = [r for r in records if r["status"] in ACTIVE]
+    known = {release_ref(r): r for r in records}
+    check = {"time": now_iso(), "ok": True, "error": None}
+    plan = []
+    for sub in subgroups:
+        image = RELEASES[sub]["image"]
+        try:
+            tags = registry_releases(image, int(site["RELEASE_KEEP"]))
+        except PollError as e:
+            check.update(ok=False, error=str(e))
+            log(state, f"release check failed: {e}", dry_run=dry_run)
+            continue
+        for tag, digest in tags:
+            rec = known.get(f"{sub}/{tag}")
+            if rec is None:
+                plan.append((sub, image, tag, digest))
+            elif rec["digest"] != digest:
+                log(state, f"release {sub}/{tag}: {image}:{tag} moved from {rec['digest']} "
+                           f"to {digest}; not converted again", dry_run=dry_run)
+    if dry_run:
+        for sub, image, tag, digest in plan:
+            log(state, f"would convert {sub}/{tag} {image}@{digest}", dry_run=True)
+        return 0 if check["ok"] else 1
+    if plan and active:
+        log(state, f"conversion active: {' '.join(release_ref(r) for r in active)}")
+    elif plan:
+        new = []
+        for sub, image, tag, digest in plan:
+            rec = {"subgroup": sub, "image": image, "tag": tag, "digest": digest,
+                   "status": "queued", "failed_stage": None, "attempts": 1, "slurm_job_ids": [],
+                   "queued_at": now_iso(), "started_at": None, "finished_at": None,
+                   "sif": None, "size": None, "sha256": None}
+            release_dir(state, sub, tag).mkdir(parents=True, exist_ok=True)
+            save_release(state, rec)
+            new.append(rec)
+        try:
+            job_id = submit_convert(state, site, new)
+        except SubmitError as e:
+            for rec in new:
+                shutil.rmtree(release_dir(state, rec["subgroup"], rec["tag"]), ignore_errors=True)
+            log(state, f"sbatch failed: {e}")
+            return 1
+        for rec in new:
+            rec["slurm_job_ids"].append(job_id)
+            save_release(state, rec)
+        log(state, f"submitted conversion {' '.join(release_ref(r) for r in new)} job {job_id}")
+    write_json(state / "last-release-check.json", check)
+    prune_releases(state, site)
+    return 0 if check["ok"] else 1
+
+
+def sha256_file(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(1 << 24), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def has_gpu():
+    try:
+        return subprocess.run(["nvidia-smi", "-L"], capture_output=True, timeout=60).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+class Tee:
+    """Writes to stdout (the Slurm job log) and to one record's own log."""
+
+    def __init__(self, path):
+        self.f = open(path, "a")
+
+    def write(self, text):
+        sys.stdout.write(text)
+        sys.stdout.flush()
+        self.f.write(text)
+        self.f.flush()
+
+    def close(self):
+        self.f.close()
+
+
+def _stream(cmd, out, step, **kwargs):
+    """Run cmd, copying its output to out; StepError(step) on failure."""
+    out.write(f"== {step} ==\n$ {' '.join(map(str, cmd))}\n")
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                                **kwargs)
+    except OSError as e:
+        out.write(f"convert: {e}\n")
+        raise StepError(step) from None
+    for line in proc.stdout:
+        out.write(line)
+    if proc.wait() != 0:
+        raise StepError(step)
+
+
+def convert(state, refs):
+    """Convert release records (SUBGROUP/TAG) inside their Slurm job, then
+    re-render the dashboard. A failed release never stops the next one.
+    """
+    site = load_site(state)
+    rc = 0
+    for ref in refs:
+        sub, _, tag = ref.partition("/")
+        rc = _convert(state, site, sub, tag) or rc
+    refresh(state, site)
+    return rc
+
+
+def _convert(state, site, sub, tag):
+    d = release_dir(state, sub, tag)
+    with ledger_lock(state):
+        rec = load_json(d / "record.json")
+        if rec is None:
+            print(f"no release record {sub}/{tag}", file=sys.stderr)
+            return 1
+        rec.update(status="running", started_at=now_iso())
+        save_release(state, rec)
+    sif, _ = release_files(site, sub, tag)
+    scratch = scratch_base(site) / "t1-convert" / f"{sub}-{tag}"
+    shutil.rmtree(scratch, ignore_errors=True)
+    (scratch / "tmp").mkdir(parents=True)
+    env = dict(os.environ, APPTAINER_CACHEDIR=str(scratch / "cache"),
+               APPTAINER_TMPDIR=str(scratch / "tmp"))
+    tmp_sif = scratch / sif.name
+    out = Tee(d / "convert.log")
+    status, stage, raw, digest = "failed", None, None, None
+    try:
+        _stream([site["APPTAINER"], "pull", "--force", str(tmp_sif),
+                 f"docker://{rec['image']}@{rec['digest']}"], out, "apptainer pull", env=env)
+        out.write("== inspect ==\n")
+        try:
+            raw = inspect_image(site, tmp_sif)
+        except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as e:
+            out.write(f"convert: inspection failed: {e}\n")
+            raise StepError("inspect") from None
+        test = RELEASES[sub].get("test")
+        if test:
+            nv = ["--nv"] if has_gpu() else []
+            with open(REPO_ROOT / test) as script:
+                _stream([site["APPTAINER"], "exec", *nv, str(tmp_sif), "bash", "-s"], out,
+                        f"release test {test}", stdin=script, env=env)
+        out.write("== sha256 ==\n")
+        digest = sha256_file(tmp_sif)
+        out.write(f"{digest}  {sif.name}\n")
+        out.write(f"== publish {sif} ==\n")
+        try:
+            sif.parent.mkdir(parents=True, exist_ok=True)
+            part = sif.with_name(f".{sif.name}.part")
+            shutil.move(tmp_sif, part)
+            os.replace(part, sif)
+            (sif.parent / f"{sif.name}.sha256").write_text(f"{digest}  {sif.name}\n")
+        except OSError as e:
+            out.write(f"convert: {e}\n")
+            raise StepError("publish") from None
+        status = "success"
+    except StepError as e:
+        stage = str(e)
+        out.write(f"convert: FAILED at {stage}\n")
+    finally:
+        out.close()
+        shutil.rmtree(scratch, ignore_errors=True)
+    if status == "success":
+        info = compose_image_info(raw, {}, sif.stat().st_size, None, sif)
+        write_json(d / "image-info.json", info)
+    with ledger_lock(state):
+        rec = load_json(d / "record.json")
+        rec.update(status=status, failed_stage=stage, finished_at=now_iso())
+        if status == "success":
+            rec.update(sif=str(sif), size=sif.stat().st_size, sha256=digest)
+        save_release(state, rec)
+        update_release_link(state, site, sub)
+    return 0 if status == "success" else 1
+
+
+def update_release_link(state, site, sub):
+    """Point <name>-latest.sif at the newest release version with an image."""
+    for rec in load_releases(state):
+        if rec["subgroup"] == sub and rec["status"] == "success":
+            sif, link = release_files(site, sub, rec["tag"])
+            if sif.is_file():
+                return replace_link(link, sif)
+    return False
+
+
+def prune_releases(state, site):
+    """Delete the .sif files of converted releases past the newest RELEASE_KEEP
+    versions of each subgroup. The file the -latest link points at stays.
+    """
+    keep = int(site["RELEASE_KEEP"])
+    done = {}
+    for rec in load_releases(state):
+        if rec["status"] == "success":
+            done.setdefault(rec["subgroup"], []).append(rec)
+    for sub, recs in done.items():
+        for rec in recs[keep:]:
+            sif, link = release_files(site, sub, rec["tag"])
+            if os.path.realpath(link) == os.path.realpath(sif):
+                continue
+            for path in (sif, sif.with_name(f"{sif.name}.sha256")):
+                if path.exists():
+                    os.remove(path)
+                    log(state, f"pruned {path}")
+
+
+def retry_release(state, ref):
+    site = load_site(state)
+    sub, _, tag = ref.partition("/")
+    d = release_dir(state, sub, tag)
+    with ledger_lock(state):
+        rec = load_json(d / "record.json")
+        if rec is None:
+            print(f"no release record {ref}", file=sys.stderr)
+            return 1
+        if rec["status"] not in RETRYABLE:
+            print(f"{ref} is {rec['status']}; retry needs failed, interrupted or cancelled",
+                  file=sys.stderr)
+            return 1
+        others = [r for r in load_releases(state) if r["status"] in ACTIVE]
+        if others:
+            print(f"conversion active: {release_ref(others[0])}", file=sys.stderr)
+            return 1
+        undo = rotate_log(d, "convert.log", rec["attempts"])
+        try:
+            job_id = submit_convert(state, site, [rec])
+        except SubmitError as e:
+            if undo:
+                undo()
+            print(f"sbatch failed: {e}", file=sys.stderr)
+            return 1
+        rec.update(attempts=rec["attempts"] + 1, status="queued", queued_at=now_iso(),
+                   started_at=None, finished_at=None, failed_stage=None)
+        rec["slurm_job_ids"].append(job_id)
+        save_release(state, rec)
+    refresh(state, site)
+    print(f"retry {ref} job {job_id} attempt {rec['attempts']}")
+    return 0
+
+
+# -- commands --------------------------------------------------------------
 
 def refresh(state, site, out=None):
     """Re-render the dashboard. Takes the ledger lock itself, so callers
@@ -595,6 +1052,7 @@ def refresh(state, site, out=None):
             records = load_records(state)
             reviews = {r["key"]: load_json(build_dir(state, r["key"]) / "review.json")
                        for r in records}
+            releases = load_releases(state)
             dashboard.render(
                 Path(out or site["DASHBOARD_DIR"]), site=site, records=records,
                 reviews=reviews,
@@ -604,6 +1062,15 @@ def refresh(state, site, out=None):
                 image_infos={r["key"]: load_json(build_dir(state, r["key"]) / "image-info.json")
                              for r in records},
                 nightly_links={s: nightly_link(site, site["VARIANT"], s) for s in SUBGROUPS},
+                subgroups=SUBGROUPS,
+                releases={s: {"config": RELEASES[s],
+                              "link": release_link(site, s),
+                              "records": [r for r in releases if r["subgroup"] == s],
+                              "infos": {r["tag"]: load_json(release_dir(state, s, r["tag"])
+                                                            / "image-info.json")
+                                        for r in releases if r["subgroup"] == s}}
+                          for s in release_subgroups(site)},
+                release_check=load_json(state / "last-release-check.json"),
                 now=datetime.now(timezone.utc))
     except Exception as e:  # the dashboard must never break a poll or a build
         print(f"render failed: {e}", file=sys.stderr, flush=True)
@@ -614,9 +1081,10 @@ def refresh(state, site, out=None):
 def poll(state, dry_run):
     site = load_site(state)
     if dry_run:
-        return _poll(state, site, True)
+        return max(_poll(state, site, True), _poll_releases(state, site, True))
     with ledger_lock(state):
         rc = _poll(state, site, False)
+        rc = max(rc, _poll_releases(state, site, False))
     refresh(state, site)
     return rc
 
@@ -640,7 +1108,7 @@ def review(state, key, note):
 def retry(state, key):
     site = load_site(state)
     with ledger_lock(state):
-        rec = load_json(record_path(state, key))
+        rec = next((r for r in load_records(state) if r["key"] == key), None)
         if rec is None:
             print(f"no record {key}", file=sys.stderr)
             return 1
@@ -653,7 +1121,7 @@ def retry(state, key):
             print(f"build active: {others[0]['key']}", file=sys.stderr)
             return 1
         try:
-            job_id = resubmit(state, site, rec)
+            job_id = resubmit(state, site, [rec])
         except SubmitError as e:
             print(f"sbatch failed: {e}", file=sys.stderr)
             return 1
@@ -665,10 +1133,13 @@ def retry(state, key):
 def status(state):
     for rec in load_records(state):
         rv = load_json(build_dir(state, rec["key"]) / "review.json")
-        line = (f"{rec['key']}  {rec['status']:<11}  a{rec['attempts']}  {rec['tag']}  "
-                f"t1={rec['t1_software_commit'][:8]}  changed={len(rec['changed'])}  "
-                f"{review_state(rec, rv)}")
+        line = (f"{rec['key']}  {rec['subgroup']:<6}  {rec['status']:<11}  a{rec['attempts']}  "
+                f"{rec['tag']}  t1={rec['t1_software_commit'][:8]}  "
+                f"changed={len(rec['changed'])}  {review_state(rec, rv)}")
         print(line.rstrip())
+    for rec in load_releases(state):
+        print(f"{release_ref(rec)}  {rec['status']:<11}  a{rec['attempts']}  {rec['digest'][:19]}  "
+              f"{rec.get('failed_stage') or ''}".rstrip())
     return 0
 
 
@@ -692,10 +1163,19 @@ def finish(state, key, status, stage):
         save_record(state, rec)
 
 
-def run(state, key):
-    """Build one record inside its Slurm job, then re-render the dashboard."""
+def run(state, keys):
+    """Build records one after another inside their Slurm job, then
+    re-render the dashboard. A failed build never stops the next one; an
+    interruption stops the job.
+    """
     site = load_site(state)
-    rc = _run(state, site, key)
+    rc = 0
+    for key in keys:
+        one = _run(state, site, key)
+        if one == 143:
+            rc = one
+            break
+        rc = one or rc
     refresh(state, site)
     return rc
 
@@ -706,22 +1186,33 @@ def _run(state, site, key):
         if rec is None:
             print(f"no record {key}", file=sys.stderr)
             return 1
+        rec.setdefault("subgroup", "lartpc")
         rec.update(status="running", started_at=now_iso())
         save_record(state, rec)
 
+    out = Tee(build_dir(state, key) / "build.log")
+    try:
+        return _build(state, site, rec, out)
+    finally:
+        out.close()
+
+
+def _build(state, site, rec, out):
+    key = rec["key"]
     # A scratch clone at the recorded commit: the image matches the key
     # even if the branch moved since the poll, and no checkout is touched.
     src = scratch_base(site) / "t1-nightly" / f"{key}-src"
     shutil.rmtree(src, ignore_errors=True)
     src.parent.mkdir(parents=True, exist_ok=True)
-    print(f"nightly: fetching t1-software {rec['t1_software_commit']} into {src}", flush=True)
+    out.write(f"nightly: {rec['subgroup']}: fetching t1-software {rec['t1_software_commit']} "
+              f"into {src}\n")
     try:
         git("init", "--quiet", str(src))
         git("-C", str(src), "fetch", "--quiet", "--depth", "1",
             site["T1_SOFTWARE_REPO"], rec["t1_software_commit"])
         git("-C", str(src), "checkout", "--quiet", "FETCH_HEAD")
     except PollError as e:
-        print(f"nightly: checkout failed: {e}", file=sys.stderr, flush=True)
+        out.write(f"nightly: checkout failed: {e}\n")
         finish(state, key, "failed", "checkout")
         shutil.rmtree(src, ignore_errors=True)
         return 1
@@ -730,6 +1221,7 @@ def _run(state, site, key):
     # base archive is mostly a 13+ GB copy of the previous one. The base is
     # still built (every subgroup image builds FROM it) and tested.
     cmd = [str(src / "scripts" / "build.sh"), "--variant", rec["variant"],
+           "--subgroup", rec["subgroup"],
            "--images-dir", rec["images_dir"], "--tag", rec["tag"], "--no-base-archive"]
     for k, v in sorted(rec["pins"].items()):
         cmd += ["--pin", f"{k}={v}"]
@@ -759,13 +1251,12 @@ def _run(state, site, key):
             proc = subprocess.Popen(cmd, cwd=src, env=env, stdout=subprocess.PIPE,
                                     stderr=subprocess.STDOUT, text=True)
         except OSError as e:
-            print(f"nightly: cannot start build.sh: {e}", file=sys.stderr, flush=True)
+            out.write(f"nightly: cannot start build.sh: {e}\n")
             finish(state, key, "failed", "start build.sh")
             shutil.rmtree(src, ignore_errors=True)
             return 1
         for line in proc.stdout:
-            sys.stdout.write(line)
-            sys.stdout.flush()
+            out.write(line)
             m = STAGE_LINE.fullmatch(line.rstrip("\n"))
             if m:
                 stage = m.group(1)
@@ -777,12 +1268,11 @@ def _run(state, site, key):
             signal.signal(s, handler)
     shutil.rmtree(src, ignore_errors=True)
     if interrupted:
-        print("nightly: interrupted; poll reconciles from sacct", flush=True)
+        out.write("nightly: interrupted; poll reconciles from sacct\n")
         return 143
     if rc == 0:
         finish(state, key, "success", None)
-        for subgroup in SUBGROUPS:
-            update_nightly_link(site, rec, subgroup)
+        update_nightly_link(site, rec)
         write_image_info(state, site, rec)
     else:
         finish(state, key, "failed", "cache lock" if lock_busy else stage)
@@ -790,25 +1280,30 @@ def _run(state, site, key):
 
 
 def prune(state, site):
-    """Delete image files of successful nightlies past the newest NIGHTLY_KEEP.
+    """Delete image files of successful nightlies past the newest NIGHTLY_KEEP
+    of each subgroup.
 
-    A file that a -latest link points at stays. Manifests, records and
-    logs always stay.
+    A file that a -latest or nightly link points at stays. Manifests,
+    records and logs always stay.
     """
     keep = int(site["NIGHTLY_KEEP"])
-    done = sorted((r for r in load_records(state) if r["status"] == "success"),
-                  key=lambda r: r.get("finished_at") or "", reverse=True)
-    for rec in done[keep:]:
-        d = Path(rec["images_dir"])
-        if not d.is_dir():
-            continue
-        latest = {os.path.realpath(p) for p in d.glob("*-latest.*") if p.is_symlink()}
-        for suffix in ("oci.tar", "sif"):
-            for path in sorted(d.glob(f"t1-*-{rec['variant']}-{rec['tag']}.{suffix}")):
-                if path.is_symlink() or os.path.realpath(path) in latest:
-                    continue
-                os.remove(path)
-                log(state, f"pruned {path}")
+    done = {}
+    for rec in sorted((r for r in load_records(state) if r["status"] == "success"),
+                      key=lambda r: r.get("finished_at") or "", reverse=True):
+        done.setdefault(rec["subgroup"], []).append(rec)
+    for recs in done.values():
+        for rec in recs[keep:]:
+            d = Path(rec["images_dir"])
+            if not d.is_dir():
+                continue
+            linked = {os.path.realpath(p) for p in [*d.glob("*-latest.*"), *d.parent.glob("*-nightly.sif")]
+                      if p.is_symlink()}
+            for suffix in ("oci.tar", "sif"):
+                for path in sorted(d.glob(f"t1-*-{rec['variant']}-{rec['tag']}.{suffix}")):
+                    if path.is_symlink() or os.path.realpath(path) in linked:
+                        continue
+                    os.remove(path)
+                    log(state, f"pruned {path}")
 
 
 def main(argv=None):
@@ -820,7 +1315,7 @@ def main(argv=None):
         p.add_argument("--state", help="state directory (default: $T1_NIGHTLY_STATE)")
         return p
 
-    p = add("poll", "resolve HEADs; submit a build for a new commit set")
+    p = add("poll", "resolve HEADs and release tags; submit builds and conversions")
     p.add_argument("--dry-run", action="store_true",
                    help="print the decisions; write nothing but the bare cache")
     p = add("review", "record a review of a build")
@@ -828,9 +1323,13 @@ def main(argv=None):
     p.add_argument("--note", required=True)
     p = add("retry", "submit a new attempt of a failed, interrupted or cancelled build")
     p.add_argument("key")
-    add("status", "one line per build, newest first")
-    p = add("run", "build one record (runs inside the Slurm job)")
-    p.add_argument("key")
+    p = add("retry-release", "submit a new attempt of a failed, interrupted or cancelled conversion")
+    p.add_argument("ref", metavar="SUBGROUP/TAG")
+    add("status", "one line per build and per release, newest first")
+    p = add("run", "build records, one after another (runs inside the Slurm job)")
+    p.add_argument("keys", nargs="+", metavar="key")
+    p = add("convert", "convert release records (runs inside the Slurm job)")
+    p.add_argument("refs", nargs="+", metavar="SUBGROUP/TAG")
     p = add("render", "write the static dashboard")
     p.add_argument("--out", help="output directory (default: DASHBOARD_DIR from site.env)")
 
@@ -847,8 +1346,12 @@ def main(argv=None):
             return review(state, args.key, args.note)
         if args.cmd == "retry":
             return retry(state, args.key)
+        if args.cmd == "retry-release":
+            return retry_release(state, args.ref)
         if args.cmd == "run":
-            return run(state, args.key)
+            return run(state, args.keys)
+        if args.cmd == "convert":
+            return convert(state, args.refs)
         if args.cmd == "render":
             return 0 if refresh(state, load_site(state), args.out) else 1
         if args.cmd == "status":

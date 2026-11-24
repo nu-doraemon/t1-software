@@ -5,7 +5,8 @@ nightly.py pipes this script into the image's python:
     apptainer exec IMAGE.sif python - < image_info.py
 
 Output: {"os", "python", "pip": [[name, version], ...],
-"conda": {name: version}, "cmake"}.
+"conda": {name: version}, "conda_builds": {name: build string},
+"cmake", "versions": {key: value} from /opt/VERSIONS ({} without it)}.
 """
 import json
 import pathlib
@@ -22,12 +23,13 @@ def os_name():
 
 
 def conda_packages():
-    out = {}
+    versions, builds = {}, {}
     for path in pathlib.Path("/opt/conda/conda-meta").glob("*.json"):
         parts = path.stem.rsplit("-", 2)  # name-version-build
         if len(parts) == 3:
-            out[parts[0]] = parts[1]
-    return out
+            versions[parts[0]] = parts[1]
+            builds[parts[0]] = parts[2]
+    return versions, builds
 
 
 def cmake_version():
@@ -38,6 +40,16 @@ def cmake_version():
         return ""
 
 
+def provenance():
+    """/opt/VERSIONS key=value lines: the sources an image was built from."""
+    path = pathlib.Path("/opt/VERSIONS")
+    if not path.is_file():
+        return {}
+    return dict(line.split("=", 1) for line in path.read_text().splitlines() if "=" in line)
+
+
 pip = sorted({(d.metadata["Name"].lower().replace("_", "-"), d.version) for d in metadata.distributions()})
+conda, conda_builds = conda_packages()
 print(json.dumps({"os": os_name(), "python": platform.python_version(), "pip": pip,
-                  "conda": conda_packages(), "cmake": cmake_version()}))
+                  "conda": conda, "conda_builds": conda_builds, "cmake": cmake_version(),
+                  "versions": provenance()}))
