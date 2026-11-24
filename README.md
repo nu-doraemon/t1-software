@@ -175,9 +175,13 @@ During the builds, the script runs a registry container
 ## Nightly builds
 
 `sites/s3df/` builds the HEAD of every tracked package once a day on
-S3DF, keeps a ledger of every build, and renders a static dashboard. It
-calls `build.sh` with `--pin` and `--tag` and never edits this repo. See
-`sites/s3df/README.md`; another site can copy that directory.
+S3DF, one image per subgroup (the t1-wc nightly is experimental), keeps
+a ledger of every build, and renders a static dashboard. It calls
+`build.sh` with `--subgroup`, `--pin` and `--tag` and never edits this
+repo. It also converts the upstream t1-wc release image (LUCiD's
+`ghcr.io/cider-ml/lucid`) to Apptainer for other HPC sites and keeps the
+newest 3 releases. See `sites/s3df/README.md`; another site can copy
+that directory.
 
 Dashboard of the S3DF builds:
 <https://s3df.slac.stanford.edu/data/neutrino/t1-software/index.html>
